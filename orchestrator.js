@@ -6,7 +6,11 @@ import { tryNuke } from "/utils/nuker.js";
 const WORKER_SCRIPTS = ["hack.js", "grow.js", "weaken.js"];
 const SECURITY_THRESHOLD = 5;  // How much above min security before we prioritize weaken
 const MONEY_THRESHOLD = 0.75;  // Grow until we have 75% of max money
-const CYCLE_DELAY = 10000;     // 10 seconds between cycles
+const CYCLE_DELAY = 300000;     // 5 minutes between cycles
+const MAX_ACTIVITY_LOG = 8;    // How many recent activities to show
+
+// Persistent activity log (survives across cycles)
+const activityLog = [];
 
 /**
  * Assess the current state of a target server and determine priority action
@@ -105,6 +109,53 @@ function deployWorkerScripts(ns, runnerServers) {
 }
 
 /**
+ * Add an entry to the activity log
+ * @param {string} message
+ */
+function logActivity(message) {
+  const timestamp = new Date().toLocaleTimeString();
+  activityLog.unshift(`[${timestamp}] ${message}`);
+  
+  // Keep log size bounded
+  while (activityLog.length > MAX_ACTIVITY_LOG) {
+    activityLog.pop();
+  }
+}
+
+/**
+ * Check completed scripts and log their results before killing
+ * @param {NS} ns
+ * @param {string[]} runnerServers
+ */
+function harvestCompletedScripts(ns, runnerServers) {
+  for (const runner of runnerServers) {
+    for (const script of WORKER_SCRIPTS) {
+      // Get all running instances of this script on this runner
+      const processes = ns.ps(runner).filter(p => p.filename === script);
+      
+      for (const proc of processes) {
+        // Check if script is still running (has threads)
+        // We can't directly check completion, but we can log what was running
+        const target = proc.args[0];
+        const threads = proc.threads;
+        
+        // Get current state of target to see if we made progress
+        const currentSec = ns.getServerSecurityLevel(target);
+        const minSec = ns.getServerMinSecurityLevel(target);
+        const currentMoney = ns.getServerMoneyAvailable(target);
+        const maxMoney = ns.getServerMaxMoney(target);
+        
+        const action = script.replace('.js', '');
+        const secDelta = (currentSec - minSec).toFixed(1);
+        const moneyPct = ((currentMoney / maxMoney) * 100).toFixed(0);
+        
+        logActivity(`${action.toUpperCase()} ${target} (${threads}t) | sec:+${secDelta} money:${moneyPct}%`);
+      }
+    }
+  }
+}
+
+/**
  * Kill all worker scripts on all runners
  * @param {NS} ns
  * @param {string[]} runnerServers
@@ -125,7 +176,10 @@ function killAllWorkers(ns, runnerServers) {
  * @returns {object} Summary of assignments
  */
 function assignTasks(ns, targetStates, runnerServers) {
-  // Kill existing workers first for clean slate
+  // Harvest info from running scripts before killing them
+  harvestCompletedScripts(ns, runnerServers);
+  
+  // Kill existing workers for clean slate
   killAllWorkers(ns, runnerServers);
   
   // Give a moment for scripts to die
@@ -211,6 +265,17 @@ function printStatus(ns, targetStates, runnerServers, taskSummary) {
     const secStr = `+${t.securityDelta.toFixed(1)} sec`;
     const actionIcon = t.priority === "hack" ? "💰" : t.priority === "grow" ? "📈" : "🔓";
     ns.print(`${actionIcon} ${t.server}: ${moneyStr} | ${secStr}`);
+  }
+  
+  // Activity log
+  ns.print("");
+  ns.print("─── RECENT ACTIVITY ───");
+  if (activityLog.length === 0) {
+    ns.print("  (waiting for first cycle to complete...)");
+  } else {
+    for (const entry of activityLog) {
+      ns.print(`  ${entry}`);
+    }
   }
   
   ns.print("");
