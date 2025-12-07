@@ -6,7 +6,7 @@ import { tryNuke } from "/utils/nuker.js";
 const WORKER_SCRIPTS = ["hack.js", "grow.js", "weaken.js"];
 const SECURITY_THRESHOLD = 5;  // How much above min security before we prioritize weaken
 const MONEY_THRESHOLD = 0.75;  // Grow until we have 75% of max money
-const CYCLE_DELAY = 600000;     // 10 minutes between cycles
+const CYCLE_DELAY = 10000;     // 10 seconds between cycles
 const MAX_ACTIVITY_LOG = 8;    // How many recent activities to show
 
 // Persistent activity log (survives across cycles)
@@ -163,7 +163,7 @@ function harvestCompletedScripts(ns, runnerServers) {
 function killAllWorkers(ns, runnerServers) {
   for (const runner of runnerServers) {
     for (const script of WORKER_SCRIPTS) {
-      ns.scriptKill(script, runner);
+      //ns.scriptKill(script, runner);
     }
   }
 }
