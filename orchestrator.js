@@ -123,80 +123,43 @@ function logActivity(message) {
 }
 
 /**
- * Check completed scripts and log their results before killing
+ * Get currently running tasks aggregated by action+target
  * @param {NS} ns
  * @param {string[]} runnerServers
+ * @returns {Map<string, number>} Map of "ACTION target" -> total threads
  */
-function harvestCompletedScripts(ns, runnerServers) {
+function getRunningTasks(ns, runnerServers) {
+  const tasks = new Map();
+  
   for (const runner of runnerServers) {
-    for (const script of WORKER_SCRIPTS) {
-      // Get all running instances of this script on this runner
-      const processes = ns.ps(runner).filter(p => p.filename === script);
+    const processes = ns.ps(runner);
+    
+    for (const proc of processes) {
+      if (!WORKER_SCRIPTS.includes(proc.filename)) continue;
       
-      for (const proc of processes) {
-        // Check if script is still running (has threads)
-        // We can't directly check completion, but we can log what was running
-        const target = proc.args[0];
-        const threads = proc.threads;
-        
-        // Get current state of target to see if we made progress
-        const currentSec = ns.getServerSecurityLevel(target);
-        const minSec = ns.getServerMinSecurityLevel(target);
-        const currentMoney = ns.getServerMoneyAvailable(target);
-        const maxMoney = ns.getServerMaxMoney(target);
-        
-        const action = script.replace('.js', '');
-        const secDelta = (currentSec - minSec).toFixed(1);
-        const moneyPct = ((currentMoney / maxMoney) * 100).toFixed(0);
-        
-        logActivity(`${action.toUpperCase()} ${target} (${threads}t) | sec:+${secDelta} money:${moneyPct}%`);
-      }
+      const action = proc.filename.replace('.js', '').toUpperCase();
+      const target = proc.args[0];
+      const key = `${action} ${target}`;
+      
+      tasks.set(key, (tasks.get(key) || 0) + proc.threads);
     }
   }
+  
+  return tasks;
 }
 
 /**
- * Kill all worker scripts on all runners
- * @param {NS} ns
- * @param {string[]} runnerServers
- */
-function killAllWorkers(ns, runnerServers) {
-  for (const runner of runnerServers) {
-    for (const script of WORKER_SCRIPTS) {
-      //ns.scriptKill(script, runner);
-    }
-  }
-}
-
-/**
- * Assign and execute tasks across all runners
+ * Assign tasks to fill available RAM (does not kill running scripts)
  * @param {NS} ns
  * @param {object[]} targetStates
  * @param {string[]} runnerServers
- * @returns {object} Summary of assignments
+ * @returns {object} Summary of new assignments
  */
 function assignTasks(ns, targetStates, runnerServers) {
-  // Harvest info from running scripts before killing them
-  harvestCompletedScripts(ns, runnerServers);
+  const newAssignments = [];
+  let newThreads = { hack: 0, grow: 0, weaken: 0 };
   
-  // Kill existing workers for clean slate
-  killAllWorkers(ns, runnerServers);
-  
-  // Give a moment for scripts to die
-  // (In practice, scriptKill is synchronous but let's be safe)
-  
-  const assignments = [];
-  let totalThreads = { hack: 0, grow: 0, weaken: 0 };
-  
-  // Track remaining capacity per runner
-  const runnerCapacity = new Map();
-  for (const runner of runnerServers) {
-    const maxRam = ns.getServerMaxRam(runner);
-    const usedRam = ns.getServerUsedRam(runner);
-    runnerCapacity.set(runner, maxRam - usedRam);
-  }
-  
-  // Assign tasks to runners based on target priorities
+  // Assign tasks to available RAM on each runner
   for (const target of targetStates) {
     const scriptName = target.priority + ".js";
     const scriptRam = ns.getScriptRam(scriptName);
@@ -204,14 +167,14 @@ function assignTasks(ns, targetStates, runnerServers) {
     if (scriptRam === 0) continue;
     
     for (const runner of runnerServers) {
-      const availableRam = runnerCapacity.get(runner);
+      const availableRam = ns.getServerMaxRam(runner) - ns.getServerUsedRam(runner);
       const threads = Math.floor(availableRam / scriptRam);
       
       if (threads > 0) {
         const pid = ns.exec(scriptName, runner, threads, target.server);
         
         if (pid > 0) {
-          assignments.push({
+          newAssignments.push({
             script: scriptName,
             runner,
             threads,
@@ -219,20 +182,32 @@ function assignTasks(ns, targetStates, runnerServers) {
             pid
           });
           
-          totalThreads[target.priority] += threads;
-          runnerCapacity.set(runner, availableRam - (threads * scriptRam));
+          newThreads[target.priority] += threads;
         }
       }
     }
   }
   
-  return { assignments, totalThreads };
+  // Log new assignments aggregated by action+target
+  const aggregated = new Map();
+  for (const a of newAssignments) {
+    const action = a.script.replace('.js', '').toUpperCase();
+    const key = `${action} ${a.target}`;
+    aggregated.set(key, (aggregated.get(key) || 0) + a.threads);
+  }
+  
+  for (const [key, threads] of aggregated) {
+    logActivity(`Started ${key} (${threads}t)`);
+  }
+  
+  return { newAssignments, newThreads };
 }
 
 /**
  * Print a status summary
  * @param {NS} ns
  * @param {object[]} targetStates
+ * @param {string[]} runnerServers
  * @param {object} taskSummary
  */
 function printStatus(ns, targetStates, runnerServers, taskSummary) {
@@ -252,12 +227,20 @@ function printStatus(ns, targetStates, runnerServers, taskSummary) {
   }
   ns.print(`🖥️  Runners: ${runnerServers.length} | RAM: ${usedRam.toFixed(0)}/${totalRam.toFixed(0)} GB`);
   
-  // Thread summary
-  const tt = taskSummary.totalThreads;
-  ns.print(`📊 Threads: H:${tt.hack} G:${tt.grow} W:${tt.weaken}`);
+  // Get all currently running tasks
+  const runningTasks = getRunningTasks(ns, runnerServers);
+  
+  // Tally total threads by action type
+  let totalByAction = { HACK: 0, GROW: 0, WEAKEN: 0 };
+  for (const [key, threads] of runningTasks) {
+    const action = key.split(' ')[0];
+    totalByAction[action] = (totalByAction[action] || 0) + threads;
+  }
+  
+  ns.print(`📊 Running: H:${totalByAction.HACK} G:${totalByAction.GROW} W:${totalByAction.WEAKEN}`);
   ns.print("");
   
-  // Top targets
+  // Top targets with current priorities
   ns.print("─── TOP TARGETS ───");
   const topTargets = targetStates.slice(0, 5);
   for (const t of topTargets) {
@@ -267,11 +250,27 @@ function printStatus(ns, targetStates, runnerServers, taskSummary) {
     ns.print(`${actionIcon} ${t.server}: ${moneyStr} | ${secStr}`);
   }
   
-  // Activity log
+  // Currently running tasks
+  ns.print("");
+  ns.print("─── RUNNING TASKS ───");
+  if (runningTasks.size === 0) {
+    ns.print("  (no tasks running)");
+  } else {
+    // Sort by thread count descending
+    const sorted = [...runningTasks.entries()].sort((a, b) => b[1] - a[1]);
+    for (const [key, threads] of sorted.slice(0, 8)) {
+      ns.print(`  ${key} (${threads}t)`);
+    }
+    if (sorted.length > 8) {
+      ns.print(`  ... and ${sorted.length - 8} more`);
+    }
+  }
+  
+  // Recent activity log
   ns.print("");
   ns.print("─── RECENT ACTIVITY ───");
   if (activityLog.length === 0) {
-    ns.print("  (waiting for first cycle to complete...)");
+    ns.print("  (waiting for activity...)");
   } else {
     for (const entry of activityLog) {
       ns.print(`  ${entry}`);
