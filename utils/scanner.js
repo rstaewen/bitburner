@@ -30,9 +30,10 @@ export function getAllServers(ns) {
  * Categorize servers into targets and runners
  * @param {NS} ns
  * @param {string[]} servers
+ * @param {boolean} includeHome - Whether to include home as a runner
  * @returns {{purchasedServers: string[], targetServers: string[], runnerServers: string[]}}
  */
-export function categorizeServers(ns, servers) {
+export function categorizeServers(ns, servers, includeHome = false) {
   const purchasedServers = ns.getPurchasedServers();
   const purchasedSet = new Set(purchasedServers);
   
@@ -40,12 +41,17 @@ export function categorizeServers(ns, servers) {
   const runnerServers = [];
   
   for (const server of servers) {
-    // Skip home for both categories
-    if (server === "home") continue;
-    
     const maxMoney = ns.getServerMaxMoney(server);
     const maxRam = ns.getServerMaxRam(server);
     const hasRoot = ns.hasRootAccess(server);
+    
+    // Handle home separately
+    if (server === "home") {
+      if (includeHome && maxRam > 0) {
+        runnerServers.push(server);
+      }
+      continue;
+    }
     
     // Target servers: have money to steal (not purchased, not home)
     if (maxMoney > 0 && !purchasedSet.has(server)) {
@@ -53,7 +59,7 @@ export function categorizeServers(ns, servers) {
     }
     
     // Runner servers: have RAM and root access (include purchased servers)
-    if (maxRam > 0 && hasRoot && server !== "home") {
+    if (maxRam > 0 && hasRoot) {
       runnerServers.push(server);
     }
   }
