@@ -4,11 +4,13 @@ import { getAllServers, categorizeServers } from "/utils/scanner.js";
 import { tryNuke } from "/utils/nuker.js";
 
 const WORKER_SCRIPTS = ["hack.js", "grow.js", "weaken.js"];
+const SHARE_SCRIPT = "share.js";
 const SECURITY_THRESHOLD = 1;      // How much above min security before we prioritize weaken
 const MONEY_THRESHOLD = 0.75;      // Grow until we have 75% of max money
 const MIN_MONEY_AFTER_HACK = 0.05; // Never allow hacks to drive money below 5% of max
 const CYCLE_DELAY = 10000;         // 10 seconds between cycles
 const MAX_ACTIVITY_LOG = 8;        // How many recent activities to show
+const DEFAULT_ANALYSIS_CORES = 1;  // Assume single-core scripts for planning estimates
 
 // Persistent activity log (survives across cycles)
 const activityLog = [];
@@ -20,16 +22,78 @@ const activityLog = [];
  */
 function parseArgs(ns) {
   const flags = {
-    ignoreHome: false
+    ignoreHome: false,
+    useFormulas: false
   };
   
   for (const arg of ns.args) {
     if (arg === "-H") {
       flags.ignoreHome = true;
+    } else if (arg === "-F") {
+      flags.useFormulas = true;
     }
   }
   
   return flags;
+}
+
+/**
+ * Create a fresh server snapshot for formulas calculations
+ * @param {NS} ns
+ * @param {string} target
+ * @param {object} overrides
+ * @returns {Server}
+ */
+function buildServerSnapshot(ns, target, overrides = {}) {
+  const server = ns.getServer(target);
+  return Object.assign(server, overrides);
+}
+
+/**
+ * Safely retrieve formulas API reference if available
+ * @param {NS} ns
+ * @returns {NS["formulas"] | null}
+ */
+function getFormulasApi(ns) {
+  try {
+    return ns.formulas || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Check whether formulas API is available
+ * @param {NS} ns
+ * @returns {boolean}
+ */
+function hasFormulasAccess(ns) {
+  const formulas = getFormulasApi(ns);
+  return Boolean(formulas && formulas.hacking);
+}
+
+/**
+ * Build calculation context for downstream helpers
+ * @param {NS} ns
+ * @param {boolean} enableFormulas
+ * @returns {{useFormulas: boolean, player?: Player, formulas?: NS["formulas"], cores: number}}
+ */
+function buildCalcContext(ns, enableFormulas) {
+  if (!enableFormulas) {
+    return { useFormulas: false, cores: DEFAULT_ANALYSIS_CORES };
+  }
+  
+  const formulas = getFormulasApi(ns);
+  if (!formulas || !formulas.hacking) {
+    return { useFormulas: false, cores: DEFAULT_ANALYSIS_CORES };
+  }
+  
+  return {
+    useFormulas: true,
+    formulas,
+    player: ns.getPlayer(),
+    cores: DEFAULT_ANALYSIS_CORES
+  };
 }
 
 /**
@@ -39,14 +103,14 @@ function parseArgs(ns) {
  * @param {string[]} runnerServers
  * @returns {object[]}
  */
-function getAllTargetStates(ns, targetServers, runnerServers) {
+function getAllTargetStates(ns, targetServers, runnerServers, calcContext) {
   const states = [];
   const inFlightThreads = getInFlightThreads(ns, runnerServers);
   
   for (const target of targetServers) {
     // Only include targets we can actually hack
     if (ns.hasRootAccess(target)) {
-      const state = assessTargetStateWithPrediction(ns, target, inFlightThreads);
+      const state = assessTargetStateWithPrediction(ns, target, inFlightThreads, calcContext);
       if (state.canHack) {
         states.push(state);
       }
@@ -83,7 +147,7 @@ function calculateAvailableThreads(ns, runner, scriptName) {
  */
 function deployWorkerScripts(ns, runnerServers) {
   for (const runner of runnerServers) {
-    ns.scp(WORKER_SCRIPTS, runner, "home");
+    ns.scp([...WORKER_SCRIPTS, SHARE_SCRIPT], runner, "home");
   }
 }
 
@@ -102,29 +166,65 @@ function logActivity(message) {
 }
 
 /**
+ * Kill any lingering share scripts so their RAM can be repurposed this cycle
+ * @param {NS} ns
+ * @param {string[]} runnerServers
+ */
+function terminateShareTasks(ns, runnerServers) {
+  for (const runner of runnerServers) {
+    const processes = ns.ps(runner);
+    for (const proc of processes) {
+      if (proc.filename === SHARE_SCRIPT) {
+        ns.kill(proc.pid);
+      }
+    }
+  }
+}
+
+/**
  * Log a task start with completion estimate and predicted outcome
  * @param {NS} ns
  * @param {string} action - "hack", "grow", or "weaken"
  * @param {string} target - target server name
  * @param {number} threads - number of threads
+ * @param {{useFormulas: boolean}} calcContext
  */
-function logTaskStart(ns, action, target, threads) {
+function logTaskStart(ns, action, target, threads, calcContext) {
   const now = new Date();
+  const useFormulas = calcContext?.useFormulas;
+  const player = calcContext?.player;
+  const serverSnapshot = useFormulas ? buildServerSnapshot(ns, target) : null;
   
   // Get operation time
   let opTime;
-  switch (action) {
-    case "hack":
-      opTime = ns.getHackTime(target);
-      break;
-    case "grow":
-      opTime = ns.getGrowTime(target);
-      break;
-    case "weaken":
-      opTime = ns.getWeakenTime(target);
-      break;
-    default:
-      opTime = 0;
+  if (useFormulas && serverSnapshot && player) {
+    switch (action) {
+      case "hack":
+        opTime = calcContext.formulas.hacking.hackTime(serverSnapshot, player);
+        break;
+      case "grow":
+        opTime = calcContext.formulas.hacking.growTime(serverSnapshot, player);
+        break;
+      case "weaken":
+        opTime = calcContext.formulas.hacking.weakenTime(serverSnapshot, player);
+        break;
+      default:
+        opTime = 0;
+    }
+  } else {
+    switch (action) {
+      case "hack":
+        opTime = ns.getHackTime(target);
+        break;
+      case "grow":
+        opTime = ns.getGrowTime(target);
+        break;
+      case "weaken":
+        opTime = ns.getWeakenTime(target);
+        break;
+      default:
+        opTime = 0;
+    }
   }
   
   const completionTime = new Date(now.getTime() + opTime);
@@ -139,18 +239,31 @@ function logTaskStart(ns, action, target, threads) {
   
   switch (action) {
     case "hack": {
-      const hackPercent = ns.hackAnalyze(target);
+      const hackPercent = useFormulas && serverSnapshot && player
+        ? calcContext.formulas.hacking.hackPercent(serverSnapshot, player)
+        : ns.hackAnalyze(target);
       const totalSteal = Math.min(1, hackPercent * threads);
       const stolenAmount = currentMoney * totalSteal;
       outcomeStr = `→ $${ns.formatNumber(stolenAmount)}`;
       break;
     }
     case "grow": {
-      const serverGrowth = ns.getServerGrowth(target);
-      const securityPenalty = 1 + (currentSecurity - minSecurity) * 0.02;
-      const baseGrowthPerThread = 1 + (serverGrowth / 100) / securityPenalty;
-      const growMultiplier = Math.pow(baseGrowthPerThread, threads / 10);
-      const predictedMoney = Math.min(maxMoney, currentMoney * growMultiplier);
+      let predictedMoney;
+      if (useFormulas && serverSnapshot && player) {
+        const multiplier = calcContext.formulas.hacking.growPercent(
+          serverSnapshot,
+          threads,
+          player,
+          calcContext.cores
+        );
+        predictedMoney = Math.min(maxMoney, currentMoney * multiplier);
+      } else {
+        const serverGrowth = ns.getServerGrowth(target);
+        const securityPenalty = 1 + (currentSecurity - minSecurity) * 0.02;
+        const baseGrowthPerThread = 1 + (serverGrowth / 100) / securityPenalty;
+        const growMultiplier = Math.pow(baseGrowthPerThread, threads / 10);
+        predictedMoney = Math.min(maxMoney, currentMoney * growMultiplier);
+      }
       const newPercent = (predictedMoney / maxMoney * 100).toFixed(0);
       outcomeStr = `→ ${newPercent}% full`;
       break;
@@ -182,16 +295,17 @@ function logTaskStart(ns, action, target, threads) {
  */
 function getRunningTasks(ns, runnerServers) {
   const tasks = new Map();
+  const trackedScripts = [...WORKER_SCRIPTS, SHARE_SCRIPT];
   
   for (const runner of runnerServers) {
     const processes = ns.ps(runner);
     
     for (const proc of processes) {
-      if (!WORKER_SCRIPTS.includes(proc.filename)) continue;
+      if (!trackedScripts.includes(proc.filename)) continue;
       
       const action = proc.filename.replace('.js', '').toUpperCase();
       const target = proc.args[0];
-      const key = `${action} ${target}`;
+      const key = target ? `${action} ${target}` : action;
       
       tasks.set(key, (tasks.get(key) || 0) + proc.threads);
     }
@@ -225,7 +339,7 @@ function calcWeakenThreadsNeeded(ns, target, predictedSecurity) {
  * @param {number} predictedMoney - money after in-flight operations complete
  * @returns {number} Additional threads needed (0 if predicted state already at target)
  */
-function calcGrowThreadsNeeded(ns, target, predictedMoney) {
+function calcGrowThreadsNeeded(ns, target, predictedMoney, calcContext) {
   const maxMoney = ns.getServerMaxMoney(target);
   const targetMoney = maxMoney * MONEY_THRESHOLD;
   
@@ -233,6 +347,11 @@ function calcGrowThreadsNeeded(ns, target, predictedMoney) {
   if (predictedMoney <= 0) return 1000; // Need some baseline if money is 0
   
   const multiplierNeeded = targetMoney / predictedMoney;
+  
+  if (calcContext?.useFormulas) {
+    const server = buildServerSnapshot(ns, target);
+    return estimateGrowThreadsWithFormulas(server, multiplierNeeded, calcContext);
+  }
   
   // Use ns.growthAnalyze to get threads needed for this multiplier
   // growthAnalyze(target, multiplier, cores) returns threads needed
@@ -249,7 +368,7 @@ function calcGrowThreadsNeeded(ns, target, predictedMoney) {
  * @param {number} predictedMoney - money after in-flight operations complete
  * @returns {number} Threads needed
  */
-function calcHackThreadsNeeded(ns, target, predictedMoney) {
+function calcHackThreadsNeeded(ns, target, predictedMoney, calcContext) {
   const maxMoney = ns.getServerMaxMoney(target);
   
   if (predictedMoney <= 0) return 0;
@@ -265,7 +384,9 @@ function calcHackThreadsNeeded(ns, target, predictedMoney) {
   if (amountToSteal <= 0) return 0;
   
   // hackAnalyze returns the fraction stolen per thread
-  const hackPercent = ns.hackAnalyze(target);
+  const hackPercent = calcContext?.useFormulas
+    ? calcContext.formulas.hacking.hackPercent(buildServerSnapshot(ns, target), calcContext.player)
+    : ns.hackAnalyze(target);
   if (hackPercent <= 0) return 0;
   
   // Each thread steals hackPercent of current money
@@ -284,17 +405,58 @@ function calcHackThreadsNeeded(ns, target, predictedMoney) {
  * @param {number} predictedSecurity
  * @returns {number} Max useful threads to assign
  */
-function calcMaxUsefulThreads(ns, target, priority, predictedMoney, predictedSecurity) {
+function calcMaxUsefulThreads(ns, target, priority, predictedMoney, predictedSecurity, calcContext) {
   switch (priority) {
     case "weaken":
       return calcWeakenThreadsNeeded(ns, target, predictedSecurity);
     case "grow":
-      return calcGrowThreadsNeeded(ns, target, predictedMoney);
+      return calcGrowThreadsNeeded(ns, target, predictedMoney, calcContext);
     case "hack":
-      return calcHackThreadsNeeded(ns, target, predictedMoney);
+      return calcHackThreadsNeeded(ns, target, predictedMoney, calcContext);
     default:
       return 0;
   }
+}
+
+/**
+ * Estimate grow threads using the formulas API via binary search
+ * @param {Server} server
+ * @param {number} multiplierNeeded
+ * @param {{formulas: NS["formulas"], player: Player, cores: number}} calcContext
+ * @returns {number}
+ */
+function estimateGrowThreadsWithFormulas(server, multiplierNeeded, calcContext) {
+  const { formulas, player, cores } = calcContext;
+  
+  // Fast-path small multipliers
+  if (multiplierNeeded <= 1) {
+    return 0;
+  }
+  
+  let low = 1;
+  let high = 1;
+  
+  while (
+    formulas.hacking.growPercent(server, high, player, cores) < multiplierNeeded &&
+    high < 1_000_000
+  ) {
+    low = high;
+    high *= 2;
+  }
+  
+  let result = high;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const multiplier = formulas.hacking.growPercent(server, mid, player, cores);
+    if (multiplier >= multiplierNeeded) {
+      result = mid;
+      high = mid - 1;
+    } else {
+      low = mid + 1;
+    }
+  }
+  
+  return Math.max(1, result);
 }
 
 /**
@@ -333,11 +495,14 @@ function getInFlightThreads(ns, runnerServers) {
  * @param {{hack: number, grow: number, weaken: number}} threads
  * @returns {{predictedMoney: number, predictedSecurity: number}}
  */
-function predictTargetState(ns, target, threads) {
+function predictTargetState(ns, target, threads, calcContext) {
   const currentMoney = ns.getServerMoneyAvailable(target);
   const maxMoney = ns.getServerMaxMoney(target);
   const currentSecurity = ns.getServerSecurityLevel(target);
   const minSecurity = ns.getServerMinSecurityLevel(target);
+  const useFormulas = calcContext?.useFormulas;
+  const player = calcContext?.player;
+  const serverSnapshot = useFormulas ? buildServerSnapshot(ns, target) : null;
   
   // Predict security changes
   // weaken reduces by 0.05 per thread
@@ -358,9 +523,14 @@ function predictTargetState(ns, target, threads) {
   
   // Estimate hack effect (each thread steals hackAnalyze % of current money)
   if (threads.hack > 0) {
-    const hackPercent = ns.hackAnalyze(target);
+    const hackPercent = useFormulas && serverSnapshot && player
+      ? calcContext.formulas.hacking.hackPercent(serverSnapshot, player)
+      : ns.hackAnalyze(target);
     const totalHackPercent = Math.min(1, hackPercent * threads.hack);
     predictedMoney *= (1 - totalHackPercent);
+    if (serverSnapshot) {
+      serverSnapshot.moneyAvailable = predictedMoney;
+    }
   }
   
   // Estimate grow effect
@@ -369,15 +539,26 @@ function predictTargetState(ns, target, threads) {
   // Use a simpler approximation: grow roughly doubles money with ~25 threads at low security
   // The actual formula involves server growth rate and security level
   if (threads.grow > 0 && predictedMoney > 0) {
-    // Approximate growth multiplier based on thread count
-    // This is a simplification - actual growth depends on server growthRate and security
-    const serverGrowth = ns.getServerGrowth(target);
-    // Base formula approximation: each thread can multiply money by ~(1 + serverGrowth/100) at min security
-    // At higher security, effectiveness is reduced
-    const securityPenalty = 1 + (currentSecurity - minSecurity) * 0.02;
-    const baseGrowthPerThread = 1 + (serverGrowth / 100) / securityPenalty;
-    const growMultiplier = Math.pow(baseGrowthPerThread, threads.grow / 10);
-    predictedMoney = Math.min(maxMoney, predictedMoney * growMultiplier);
+    if (useFormulas && serverSnapshot && player) {
+      serverSnapshot.moneyAvailable = predictedMoney;
+      const multiplier = calcContext.formulas.hacking.growPercent(
+        serverSnapshot,
+        threads.grow,
+        player,
+        calcContext.cores
+      );
+      predictedMoney = Math.min(maxMoney, predictedMoney * multiplier);
+    } else {
+      // Approximate growth multiplier based on thread count
+      // This is a simplification - actual growth depends on server growthRate and security
+      const serverGrowth = ns.getServerGrowth(target);
+      // Base formula approximation: each thread can multiply money by ~(1 + serverGrowth/100) at min security
+      // At higher security, effectiveness is reduced
+      const securityPenalty = 1 + (currentSecurity - minSecurity) * 0.02;
+      const baseGrowthPerThread = 1 + (serverGrowth / 100) / securityPenalty;
+      const growMultiplier = Math.pow(baseGrowthPerThread, threads.grow / 10);
+      predictedMoney = Math.min(maxMoney, predictedMoney * growMultiplier);
+    }
   }
   
   return {
@@ -393,19 +574,21 @@ function predictTargetState(ns, target, threads) {
  * @param {Map<string, {hack: number, grow: number, weaken: number}>} inFlightThreads
  * @returns {object} Target state with priority based on predicted state
  */
-function assessTargetStateWithPrediction(ns, target, inFlightThreads) {
+function assessTargetStateWithPrediction(ns, target, inFlightThreads, calcContext) {
   const currentMoney = ns.getServerMoneyAvailable(target);
   const maxMoney = ns.getServerMaxMoney(target);
   const currentSecurity = ns.getServerSecurityLevel(target);
   const minSecurity = ns.getServerMinSecurityLevel(target);
-  const hackChance = ns.hackAnalyzeChance(target);
+  const hackChance = calcContext?.useFormulas
+    ? calcContext.formulas.hacking.hackChance(buildServerSnapshot(ns, target), calcContext.player)
+    : ns.hackAnalyzeChance(target);
   
   // Get in-flight threads for this target
   const threads = inFlightThreads.get(target) || { hack: 0, grow: 0, weaken: 0 };
   const hasGrowInFlight = threads.grow > 0;
   
   // Get predicted state after in-flight operations complete
-  const { predictedMoney, predictedSecurity } = predictTargetState(ns, target, threads);
+  const { predictedMoney, predictedSecurity } = predictTargetState(ns, target, threads, calcContext);
   
   const predictedMoneyPercent = maxMoney > 0 ? predictedMoney / maxMoney : 0;
   const predictedSecurityDelta = predictedSecurity - minSecurity;
@@ -433,7 +616,7 @@ function assessTargetStateWithPrediction(ns, target, inFlightThreads) {
   // This tells us how many more threads we need to reach our thresholds
   const maxUsefulThreads = hackBlocked
     ? 0
-    : calcMaxUsefulThreads(ns, target, priority, predictedMoney, predictedSecurity);
+    : calcMaxUsefulThreads(ns, target, priority, predictedMoney, predictedSecurity, calcContext);
   
   return {
     server: target,
@@ -470,7 +653,7 @@ function assessTargetStateWithPrediction(ns, target, inFlightThreads) {
  * @param {string[]} runnerServers
  * @returns {object} Summary of new assignments
  */
-function assignTasks(ns, targetStates, runnerServers) {
+function assignTasks(ns, targetStates, runnerServers, calcContext) {
   const newAssignments = [];
   let newThreads = { hack: 0, grow: 0, weaken: 0 };
   
@@ -554,10 +737,39 @@ function assignTasks(ns, targetStates, runnerServers) {
   
   for (const [key, threads] of aggregated) {
     const [action, target] = key.split('|');
-    logTaskStart(ns, action, target, threads);
+    logTaskStart(ns, action, target, threads, calcContext);
   }
   
   return { newAssignments, newThreads };
+}
+
+/**
+ * Use all remaining RAM for share() on each runner
+ * @param {NS} ns
+ * @param {string[]} runnerServers
+ * @returns {number} Total share threads launched
+ */
+function assignShareTasks(ns, runnerServers) {
+  const scriptRam = ns.getScriptRam(SHARE_SCRIPT);
+  if (scriptRam === 0) return 0;
+  
+  let totalThreads = 0;
+  
+  for (const runner of runnerServers) {
+    const availableThreads = calculateAvailableThreads(ns, runner, SHARE_SCRIPT);
+    if (availableThreads <= 0) continue;
+    
+    const pid = ns.exec(SHARE_SCRIPT, runner, availableThreads);
+    if (pid > 0) {
+      totalThreads += availableThreads;
+    }
+  }
+  
+  if (totalThreads > 0) {
+    logActivity(`SHARE utilizing ${totalThreads} idle threads`);
+  }
+  
+  return totalThreads;
 }
 
 /**
@@ -590,18 +802,21 @@ function printStatus(ns, targetStates, runnerServers, taskSummary, includeHome) 
   const runningTasks = getRunningTasks(ns, runnerServers);
   
   // Tally total threads by action type
-  let totalByAction = { HACK: 0, GROW: 0, WEAKEN: 0 };
+  let totalByAction = { HACK: 0, GROW: 0, WEAKEN: 0, SHARE: 0 };
   for (const [key, threads] of runningTasks) {
     const action = key.split(' ')[0];
     totalByAction[action] = (totalByAction[action] || 0) + threads;
   }
   
-  ns.print(`📊 Running: H:${totalByAction.HACK} G:${totalByAction.GROW} W:${totalByAction.WEAKEN}`);
+  ns.print(`📊 Running: H:${totalByAction.HACK || 0} G:${totalByAction.GROW || 0} W:${totalByAction.WEAKEN || 0} S:${totalByAction.SHARE || 0}`);
+  if (taskSummary.shareThreads > 0) {
+    ns.print(`♻️  Share threads launched this cycle: +${taskSummary.shareThreads}`);
+  }
   ns.print("");
   
   // Top targets with current priorities
   ns.print("─── TOP TARGETS (priority based on prediction) ───");
-  const topTargets = targetStates.slice(0, 11);
+  const topTargets = targetStates.slice(0, 21);
   for (const t of topTargets) {
     const moneyStr = `${ns.formatNumber(t.maxMoney)}: ${(t.moneyPercent * 100).toFixed(0)}%→${(t.predictedMoneyPercent * 100).toFixed(0)}%`;
     const secStr = `C:${t.securityMultiplier.toFixed(1)}x+${t.securityDelta.toFixed(1)}→${t.predictedSecurityDelta.toFixed(1)}`;
@@ -654,6 +869,10 @@ export async function main(ns) {
   ns.print("");
   
   while (true) {
+    const calcContext = buildCalcContext(ns, flags.useFormulas);
+    if (flags.useFormulas && !calcContext.useFormulas) {
+      ns.print("⚠️  Formulas requested (-F) but API unavailable. Falling back to vanilla sims.");
+    }
     // 1. Scan network
     const allServers = getAllServers(ns);
     
@@ -671,16 +890,22 @@ export async function main(ns) {
     // 4. Deploy worker scripts
     deployWorkerScripts(ns, runnerServers);
     
-    // 5. Assess all targets (with prediction based on in-flight tasks)
-    const targetStates = getAllTargetStates(ns, targetServers, runnerServers);
+    // 5. Reclaim RAM used by previous share cycles
+    terminateShareTasks(ns, runnerServers);
     
-    // 6. Assign and execute tasks
-    const taskSummary = assignTasks(ns, targetStates, runnerServers);
+    // 6. Assess all targets (with prediction based on in-flight tasks)
+    const targetStates = getAllTargetStates(ns, targetServers, runnerServers, calcContext);
     
-    // 7. Print status
+    // 7. Assign and execute tasks
+    const taskSummary = assignTasks(ns, targetStates, runnerServers, calcContext);
+    
+    // 8. Fill remaining RAM with share scripts
+    taskSummary.shareThreads = assignShareTasks(ns, runnerServers);
+    
+    // 9. Print status
     printStatus(ns, targetStates, runnerServers, taskSummary, includeHome);
     
-    // 8. Wait before next cycle
+    // 10. Wait before next cycle
     await ns.sleep(CYCLE_DELAY);
   }
 }
