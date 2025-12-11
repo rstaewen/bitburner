@@ -3,6 +3,7 @@ import { getAllServers } from "/utils/scanner.js";
 const TOP_TARGETS = 5;
 const SAMPLE_INTERVAL = 5_000; // ms
 const MIN_REMAINING_FRACTION = 0.05; // Leave 5% (steal 95%) when estimating theoretical max
+const TRADING_HISTORY_LENGTH = 30;
 
 /**
  * Try to access the Formulas API (requires purchased program in-game)
@@ -77,15 +78,115 @@ function format(ns, value) {
   return ns.formatNumber(value, 2).padStart(10, " ");
 }
 
+function computeInvestmentCapital(ns) {
+  if (!ns.stock || !ns.stock.hasTIXAPIAccess()) return null;
+  let capital = ns.getServerMoneyAvailable("home");
+  const symbols = ns.stock.getSymbols();
+  for (const symbol of symbols) {
+    const [longShares, , shortShares] = ns.stock.getPosition(symbol);
+    if (longShares > 0 || shortShares > 0) {
+      const price = ns.stock.getPrice(symbol);
+      capital += (longShares + shortShares) * price;
+    }
+  }
+  return capital;
+}
+
+function updateInvestmentTracker(ns, tracker, hackingAttribution) {
+  const capital = computeInvestmentCapital(ns);
+  if (capital === null) return null;
+  const adjustedCapital = Math.max(0, capital - (hackingAttribution ?? 0));
+
+  if (tracker.baseline === null && adjustedCapital > 0) {
+    tracker.baseline = adjustedCapital;
+  }
+
+  const now = Date.now();
+  const elapsedSec = Math.max(1, (now - tracker.startTime) / 1000);
+  const delta = tracker.baseline !== null ? adjustedCapital - tracker.baseline : 0;
+  const pctGain =
+    tracker.baseline && tracker.baseline > 0 ? (delta / tracker.baseline) * 100 : 0;
+  const perHour = delta / (elapsedSec / 3600);
+
+  tracker.history.push({ capital: adjustedCapital, timestamp: now });
+  while (tracker.history.length > TRADING_HISTORY_LENGTH) {
+    tracker.history.shift();
+  }
+
+  tracker.lastCapital = adjustedCapital;
+  tracker.lastUpdate = now;
+
+  return {
+    capital: adjustedCapital,
+    baseline: tracker.baseline,
+    pctGain,
+    delta,
+    perHour
+  };
+}
+
+function getHeldPositions(ns) {
+  if (!ns.stock || !ns.stock.hasTIXAPIAccess()) return [];
+
+  const positions = [];
+  for (const symbol of ns.stock.getSymbols()) {
+    const [longShares, longAvg, shortShares, shortAvg] = ns.stock.getPosition(symbol);
+    if (longShares <= 0 && shortShares <= 0) continue;
+
+    const forecast = ns.stock.getForecast(symbol);
+    const price = ns.stock.getPrice(symbol);
+
+    if (longShares > 0) {
+      const saleGain = ns.stock.getSaleGain(symbol, longShares, "Long");
+      const invested = longShares * longAvg;
+      const delta = saleGain - invested;
+      positions.push({
+        symbol,
+        side: "LONG",
+        shares: longShares,
+        avg: longAvg,
+        price,
+        delta,
+        forecast
+      });
+    }
+
+    if (shortShares > 0) {
+      const coverCost = ns.stock.getSaleGain(symbol, shortShares, "Short");
+      const entryProceeds = shortShares * shortAvg;
+      const delta = entryProceeds - coverCost;
+      positions.push({
+        symbol,
+        side: "SHORT",
+        shares: shortShares,
+        avg: shortAvg,
+        price,
+        delta,
+        forecast
+      });
+    }
+  }
+
+  positions.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+  return positions;
+}
+
 /**
  * @param {NS} ns
  */
 export async function main(ns) {
   ns.disableLog("ALL");
-  ns.tail();
+  ns.ui.openTail();
   ns.clearLog();
 
   const stats = new Map(); // server -> {prevMoney, actualEarned, lastDelta, theoreticalPerSec}
+  const tradingTracker = {
+    baseline: null,
+    history: [],
+    lastCapital: 0,
+    lastUpdate: null,
+    startTime: Date.now()
+  };
   const startTime = Date.now();
 
   while (true) {
@@ -161,6 +262,50 @@ export async function main(ns) {
     ns.print(`Aggregate theoretical max: $${ns.formatNumber(totalTheoreticalPerSec)}/s`);
     const aggregateEfficiency = totalTheoreticalPerSec > 0 ? (totalActualPerSec / totalTheoreticalPerSec) * 100 : 0;
     ns.print(`Efficiency vs theoretical: ${aggregateEfficiency.toFixed(1)}%`);
+
+    const tradingSummary = updateInvestmentTracker(ns, tradingTracker, totalActual);
+    if (tradingSummary) {
+      ns.print("");
+      ns.print("══════ STOCK-TRADER PERFORMANCE ══════");
+      if (tradingSummary.capital <= 0) {
+        ns.print("No active holdings detected (waiting for investments).");
+      } else if (!tradingSummary.baseline || tradingSummary.baseline <= 0) {
+        ns.print(
+          `Tracking baseline… current investment capital $${ns.formatNumber(tradingSummary.capital)}`
+        );
+      } else {
+        ns.print(
+          `Investment capital: $${ns
+            .formatNumber(tradingSummary.capital)} (baseline $${ns.formatNumber(tradingSummary.baseline)})`
+        );
+        ns.print(
+          `Total change: $${ns.formatNumber(tradingSummary.delta)} (${tradingSummary.pctGain.toFixed(2)}%)`
+        );
+        ns.print(`Change rate: $${ns.formatNumber(tradingSummary.perHour)}/hr since tracking start`);
+      }
+
+      const heldPositions = getHeldPositions(ns);
+      ns.print("");
+      ns.print("══════ HELD POSITIONS ══════");
+      if (heldPositions.length === 0) {
+        ns.print("No open positions to display.");
+      } else {
+        ns.print("Symbol | Side  | Shares | Avg Px | Curr Px | Δ if Exit | Forecast");
+        ns.print("----------------------------------------------------------------");
+        for (const pos of heldPositions) {
+          const line = [
+            pos.symbol.padEnd(6),
+            pos.side.padEnd(5),
+            pos.shares.toString().padStart(6),
+            ns.formatNumber(pos.avg, 2).padStart(8),
+            ns.formatNumber(pos.price, 2).padStart(8),
+            `${pos.delta >= 0 ? "+" : ""}$${ns.formatNumber(pos.delta, 2)}`.padStart(12),
+            `${(pos.forecast * 100).toFixed(1)}%`.padStart(7)
+          ].join(" | ");
+          ns.print(line);
+        }
+      }
+    }
 
     await ns.sleep(SAMPLE_INTERVAL);
   }
