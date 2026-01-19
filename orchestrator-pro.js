@@ -21,6 +21,9 @@ const LOOP_DELAY = 2000; // ms between orchestrator passes
 const DEFAULT_ANALYSIS_CORES = 1;
 const ACTIVITY_LIMIT = 8;
 const HACK_FLOOR_TOLERANCE = 1.2; // Allow 20% overshoot when checking hack success
+const MONEY_DIVERGENCE_THRESHOLD = 10; // percentage points difference
+const SECURITY_DELTA_TOLERANCE = 0.05;
+const WEAKEN_GRACE_MS = 2000;
 
 const activityLog = [];
 const targetStates = new Map();
@@ -31,9 +34,15 @@ function parseArgs(ns) {
     ["formulas", false],
     ["targets", 3] // How many targets to try batching per loop
   ]);
+
+  // Support both "--flag" (ns.flags) and bare positional tokens (e.g. "ignore-home")
+  const positional = new Set((flags._ ?? []).map(String));
+  const includeHome = positional.has("ignore-home") ? false : !flags["ignore-home"];
+  const useFormulas = positional.has("formulas") ? true : flags.formulas;
+
   return {
-    includeHome: !flags["ignore-home"],
-    useFormulas: flags.formulas,
+    includeHome,
+    useFormulas,
     maxTargets: Math.max(1, Number(flags.targets) || 1)
   };
 }
@@ -191,16 +200,17 @@ function calcHackThreads(ns, target, moneyAfterGrow, calcContext) {
   return Math.ceil(stealAmount / (moneyAfterGrow * hackPercent));
 }
 
-function calcWeakenThreads(currentSecurity, minSecurity, growThreads, hackThreads) {
+function calcWeakenAllocation(currentSecurity, minSecurity, growThreads, hackThreads) {
   const existingDelta = Math.max(0, currentSecurity - minSecurity);
-  const addedSecurity =
-    growThreads * SECURITY_PER_GROW +
-    hackThreads * SECURITY_PER_HACK;
-  const totalDelta = existingDelta + addedSecurity;
-  if (totalDelta <= 0) {
-    return 0;
-  }
-  return Math.ceil(totalDelta / SECURITY_PER_WEAKEN);
+  const growSecurity = growThreads * SECURITY_PER_GROW;
+  const hackSecurity = hackThreads * SECURITY_PER_HACK;
+  const weakenAfterGrow = Math.max(0, Math.ceil((existingDelta + growSecurity) / SECURITY_PER_WEAKEN));
+  const weakenAfterHack = Math.max(0, Math.ceil(hackSecurity / SECURITY_PER_WEAKEN));
+  return {
+    weakenAfterGrow,
+    weakenAfterHack,
+    total: weakenAfterGrow + weakenAfterHack
+  };
 }
 
 function buildBatchPlan(ns, target, calcContext) {
@@ -217,14 +227,15 @@ function buildBatchPlan(ns, target, calcContext) {
   if (hackThreads <= 0) {
     return null;
   }
-  const weakenThreads = calcWeakenThreads(currentSecurity, minSecurity, growThreads, hackThreads);
+  const weakenAllocation = calcWeakenAllocation(currentSecurity, minSecurity, growThreads, hackThreads);
 
   const growTime = ns.getGrowTime(target);
   const hackTime = ns.getHackTime(target);
   const weakenTime = ns.getWeakenTime(target);
 
   const hackDelay = Math.max(0, growTime + BATCH_STAGGER - hackTime);
-  const weakenDelay = Math.max(0, growTime + 2 * BATCH_STAGGER - weakenTime);
+  const weakenGrowDelay = Math.max(0, growTime + BATCH_STAGGER - weakenTime);
+  const weakenHackDelay = Math.max(0, hackDelay + hackTime + BATCH_STAGGER - weakenTime);
 
   const ram = {
     grow: ns.getScriptRam(WORKER_SCRIPTS.grow),
@@ -238,19 +249,21 @@ function buildBatchPlan(ns, target, calcContext) {
   const totalRam =
     growThreads * ram.grow +
     hackThreads * ram.hack +
-    weakenThreads * ram.weaken;
+    weakenAllocation.total * ram.weaken;
 
   return {
     target,
     maxMoney,
     growThreads,
     hackThreads,
-    weakenThreads,
+    weakenGrowThreads: weakenAllocation.weakenAfterGrow,
+    weakenHackThreads: weakenAllocation.weakenAfterHack,
     growTime,
     hackTime,
     weakenTime,
     hackDelay,
-    weakenDelay,
+    weakenGrowDelay,
+    weakenHackDelay,
     ram,
     totalRam,
     currentSecurity,
@@ -273,7 +286,7 @@ function downscalePlanForRam(plan, availableRam) {
   for (let i = 0; i < 20; i++) {
     const growThreads = Math.max(0, Math.floor(plan.growThreads * scale));
     const hackThreads = plan.hackThreads > 0 ? Math.max(1, Math.floor(plan.hackThreads * scale)) : 0;
-    const weakenThreads = calcWeakenThreads(
+    const weakenAllocation = calcWeakenAllocation(
       plan.currentSecurity,
       plan.minSecurity,
       growThreads,
@@ -283,14 +296,15 @@ function downscalePlanForRam(plan, availableRam) {
     const totalRam =
       growThreads * ram.grow +
       hackThreads * ram.hack +
-      weakenThreads * ram.weaken;
+      weakenAllocation.total * ram.weaken;
 
     if (totalRam <= availableRam && (plan.hackThreads === 0 || hackThreads > 0)) {
       return {
         ...plan,
         growThreads,
         hackThreads,
-        weakenThreads,
+        weakenGrowThreads: weakenAllocation.weakenAfterGrow,
+        weakenHackThreads: weakenAllocation.weakenAfterHack,
         totalRam
       };
     }
@@ -326,7 +340,7 @@ function dispatchAction(ns, ramMap, script, threads, args) {
 function recordPlanLaunch(plan) {
   const now = Date.now();
   const hackEnd = now + (plan.hackDelay ?? 0) + plan.hackTime;
-  const weakenEnd = now + (plan.weakenDelay ?? 0) + plan.weakenTime;
+  const weakenEnd = now + (plan.weakenHackDelay ?? 0) + plan.weakenTime;
   targetStates.set(plan.target, {
     expectedMoney: plan.expectedMoney,
     expectedHackEnd: hackEnd,
@@ -338,7 +352,8 @@ function recordPlanLaunch(plan) {
 function dispatchBatch(ns, ramMap, plan) {
   const growArgs = [plan.target, 0];
   const hackArgs = [plan.target, plan.hackDelay];
-  const weakenArgs = [plan.target, plan.weakenDelay];
+  const weakenGrowArgs = [plan.target, plan.weakenGrowDelay];
+  const weakenHackArgs = [plan.target, plan.weakenHackDelay];
 
   const growLaunched = dispatchAction(ns, ramMap, WORKER_SCRIPTS.grow, plan.growThreads, growArgs);
   if (growLaunched < plan.growThreads) {
@@ -352,13 +367,19 @@ function dispatchBatch(ns, ramMap, plan) {
     return false;
   }
 
-  const weakenLaunched = dispatchAction(ns, ramMap, WORKER_SCRIPTS.weaken, plan.weakenThreads, weakenArgs);
-  if (weakenLaunched < plan.weakenThreads) {
-    logActivity(`⚠️ Failed to fully launch weaken batch for ${plan.target}`);
+  const weakenGrowLaunched = dispatchAction(ns, ramMap, WORKER_SCRIPTS.weaken, plan.weakenGrowThreads, weakenGrowArgs);
+  if (weakenGrowLaunched < plan.weakenGrowThreads) {
+    logActivity(`⚠️ Failed to launch grow-guard weaken for ${plan.target}`);
     return false;
   }
 
-  const totalThreads = plan.growThreads + plan.hackThreads + plan.weakenThreads;
+  const weakenHackLaunched = dispatchAction(ns, ramMap, WORKER_SCRIPTS.weaken, plan.weakenHackThreads, weakenHackArgs);
+  if (weakenHackLaunched < plan.weakenHackThreads) {
+    logActivity(`⚠️ Failed to launch hack-guard weaken for ${plan.target}`);
+    return false;
+  }
+
+  const totalThreads = plan.growThreads + plan.hackThreads + plan.weakenGrowThreads + plan.weakenHackThreads;
   recordPlanLaunch(plan);
   const label = plan.type === "recovery" ? "Recovery" : "Batch";
   logActivity(`🚀 ${label} launched on ${plan.target} (${totalThreads} threads)`);
@@ -380,6 +401,68 @@ function getCandidateTargets(ns, targets) {
     .sort((a, b) => b.score - a.score);
 }
 
+function describeInflight(counts) {
+  if (!counts) return "none";
+  const parts = [];
+  if (counts.grow) parts.push(`G${counts.grow}`);
+  if (counts.hack) parts.push(`H${counts.hack}`);
+  if (counts.weaken) parts.push(`W${counts.weaken}`);
+  return parts.length > 0 ? parts.join(" ") : "none";
+}
+
+function formatExpectationLabel(expectedPct) {
+  if (expectedPct === null) return "none";
+  if (expectedPct <= TARGET_FLOOR * 100 + 0.5) {
+    return `floor (${expectedPct.toFixed(1)}%)`;
+  }
+  if (expectedPct >= 99) {
+    return `cap (${expectedPct.toFixed(1)}%)`;
+  }
+  return `${expectedPct.toFixed(1)}%`;
+}
+
+function buildTargetDiagnostic(ns, target, inFlight) {
+  const state = targetStates.get(target);
+  const counts = inFlight.get(target) || { hack: 0, grow: 0, weaken: 0 };
+  const maxMoney = ns.getServerMaxMoney(target);
+  const currentMoney = ns.getServerMoneyAvailable(target);
+  const moneyPct = maxMoney > 0 ? (currentMoney / maxMoney) * 100 : 0;
+  const currentSecurity = ns.getServerSecurityLevel(target);
+  const minSecurity = ns.getServerMinSecurityLevel(target);
+  const secDelta = currentSecurity - minSecurity;
+
+  let expectedPct = null;
+  if (state && typeof state.expectedMoney === "number" && maxMoney > 0) {
+    expectedPct = Math.min(100, Math.max(0, (state.expectedMoney / maxMoney) * 100));
+  }
+  const expectationLabel = state ? `${state.type} → ${formatExpectationLabel(expectedPct)}` : "none";
+  const inflightLabel = describeInflight(counts);
+
+  const redFlags = [];
+  if (expectedPct !== null) {
+    const diff = Math.abs(moneyPct - expectedPct);
+    if (diff > MONEY_DIVERGENCE_THRESHOLD) {
+      redFlags.push(`money Δ${diff.toFixed(1)}%`);
+    }
+  }
+  const now = Date.now();
+  const weakenEta = state?.expectedWeakenEnd ?? 0;
+  const secureGrace = weakenEta + WEAKEN_GRACE_MS;
+  if (secDelta > SECURITY_DELTA_TOLERANCE && now > secureGrace) {
+    redFlags.push(`security +${secDelta.toFixed(2)}`);
+  }
+
+  const etaLabel = state?.expectedWeakenEnd
+    ? `, eta ${(Math.max(0, state.expectedWeakenEnd - now) / 1000).toFixed(1)}s`
+    : "";
+  let line = `${target} | money ${moneyPct.toFixed(1)}% | sec +${secDelta.toFixed(2)} | inflight ${inflightLabel} | plan ${expectationLabel}${etaLabel}`;
+  if (redFlags.length > 0) {
+    line += ` | ⚠️ ${redFlags.join(", ")}`;
+  }
+
+  return { line, redFlags };
+}
+
 function buildRecoveryPlan(ns, target, calcContext) {
   const maxMoney = ns.getServerMaxMoney(target);
   if (maxMoney <= 0) return null;
@@ -394,28 +477,31 @@ function buildRecoveryPlan(ns, target, calcContext) {
   }
   const currentSecurity = ns.getServerSecurityLevel(target);
   const minSecurity = ns.getServerMinSecurityLevel(target);
-  const weakenThreads = calcWeakenThreads(currentSecurity, minSecurity, 0, hackThreads);
+  const weakenAllocation = calcWeakenAllocation(currentSecurity, minSecurity, 0, hackThreads);
   const hackTime = ns.getHackTime(target);
   const weakenTime = ns.getWeakenTime(target);
-  const weakenDelay = Math.max(0, hackTime + BATCH_STAGGER - weakenTime);
+  const weakenGrowDelay = Math.max(0, BATCH_STAGGER - weakenTime); // settle existing delta quickly
+  const weakenHackDelay = Math.max(0, hackTime + BATCH_STAGGER - weakenTime);
   const ram = {
     grow: 0,
     hack: ns.getScriptRam(WORKER_SCRIPTS.hack),
     weaken: ns.getScriptRam(WORKER_SCRIPTS.weaken)
   };
   if (ram.hack === 0 || ram.weaken === 0) return null;
-  const totalRam = hackThreads * ram.hack + weakenThreads * ram.weaken;
+  const totalRam = hackThreads * ram.hack + weakenAllocation.total * ram.weaken;
   return {
     target,
     maxMoney,
     growThreads: 0,
     hackThreads,
-    weakenThreads,
+    weakenGrowThreads: weakenAllocation.weakenAfterGrow,
+    weakenHackThreads: weakenAllocation.weakenAfterHack,
     growTime: 0,
     hackTime,
     weakenTime,
     hackDelay: 0,
-    weakenDelay,
+    weakenGrowDelay,
+    weakenHackDelay,
     ram,
     totalRam,
     currentSecurity,
@@ -450,21 +536,49 @@ function evaluateTargetStates(ns) {
   return recoveryTargets;
 }
 
-function printStatus(ns, candidates, ramMap) {
+function printStatus(ns, candidates, ramMap, inFlight) {
   ns.clearLog();
   ns.print("══════════════════════════════════════");
   ns.print("          ORCHESTRATOR PRO            ");
   ns.print("══════════════════════════════════════");
   ns.print(`Free RAM: ${ns.formatRam(getTotalFreeRam(ramMap))}`);
   ns.print("");
-  ns.print("Top Targets");
-  for (const { server, score } of candidates.slice(0, 8)) {
-    const moneyPct = (ns.getServerMoneyAvailable(server) / Math.max(1, ns.getServerMaxMoney(server)) * 100).toFixed(1);
-    const secDelta = (ns.getServerSecurityLevel(server) - ns.getServerMinSecurityLevel(server)).toFixed(2);
-    ns.print(`- ${server} | ${moneyPct}% money | +${secDelta} sec | score:${ns.formatNumber(score)}`);
+  ns.print("Target diagnostics");
+  const seen = new Set();
+  const targetOrder = [];
+  for (const { server } of candidates) {
+    if (!seen.has(server)) {
+      seen.add(server);
+      targetOrder.push(server);
+    }
+  }
+  for (const target of targetStates.keys()) {
+    if (!seen.has(target)) {
+      seen.add(target);
+      targetOrder.push(target);
+    }
+  }
+  if (targetOrder.length === 0) {
+    ns.print("  (no viable targets)");
+  } else {
+    const redFlagSummaries = [];
+    for (const target of targetOrder) {
+      const { line, redFlags } = buildTargetDiagnostic(ns, target, inFlight);
+      ns.print(`  ${line}`);
+      if (redFlags.length > 0) {
+        redFlagSummaries.push(`${target}: ${redFlags.join(", ")}`);
+      }
+    }
+    if (redFlagSummaries.length > 0) {
+      ns.print("");
+      ns.print("⚠️ Red flags detected");
+      for (const entry of redFlagSummaries) {
+        ns.print(`  ${entry}`);
+      }
+    }
   }
   ns.print("");
-  ns.print("Recent Activity");
+  ns.print("Recent activity");
   if (activityLog.length === 0) {
     ns.print("  (none yet)");
   } else {
@@ -478,6 +592,7 @@ export async function main(ns) {
   ns.disableLog("ALL");
   const flags = parseArgs(ns);
   ns.tail();
+  logActivity(`🚀 Orchestrator Pro started. [Using formulas: ${flags.useFormulas}] [Including home: ${flags.includeHome}]`);
 
   while (true) {
     const calcContext = buildCalcContext(ns, flags.useFormulas);
@@ -559,7 +674,7 @@ export async function main(ns) {
       logActivity("⏳ Waiting for targets or RAM to free up");
     }
 
-    printStatus(ns, candidates, ramMap);
+    printStatus(ns, candidates, ramMap, inFlight);
     await ns.sleep(LOOP_DELAY);
   }
 }

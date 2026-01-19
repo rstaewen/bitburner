@@ -3,6 +3,8 @@
 import { getAllServers, categorizeServers } from "/utils/scanner.js";
 import { tryNuke } from "/utils/nuker.js";
 
+const BACKDOOR_WARN_COOLDOWN = 300000; // 5 minutes
+const BACKDOOR_SCRIPT = "utils/backdoor-sluts.js"
 const WORKER_SCRIPTS = ["hack.js", "grow.js", "weaken.js"];
 const SHARE_SCRIPT = "share.js";
 const SECURITY_THRESHOLD = 1;      // How much above min security before we prioritize weaken
@@ -11,6 +13,7 @@ const MIN_MONEY_AFTER_HACK = 0.05; // Never allow hacks to drive money below 5% 
 const CYCLE_DELAY = 10000;         // 10 seconds between cycles
 const MAX_ACTIVITY_LOG = 8;        // How many recent activities to show
 const DEFAULT_ANALYSIS_CORES = 1;  // Assume single-core scripts for planning estimates
+const RESERVED_SERVERS = ["nexus", "nexus-0"];   // Servers reserved for auxiliary scripts
 
 // Persistent activity log (survives across cycles)
 const activityLog = [];
@@ -25,7 +28,7 @@ function parseArgs(ns) {
     ignoreHome: false,
     useFormulas: false
   };
-  
+
   for (const arg of ns.args) {
     if (arg === "-H") {
       flags.ignoreHome = true;
@@ -33,7 +36,7 @@ function parseArgs(ns) {
       flags.useFormulas = true;
     }
   }
-  
+
   return flags;
 }
 
@@ -63,35 +66,65 @@ function getFormulasApi(ns) {
 }
 
 /**
- * Check whether formulas API is available
- * @param {NS} ns
- * @returns {boolean}
+ * @typedef {Object} CalcContextOptions
+ * @property {boolean} useFormulas
+ * @property {Player} [player]
+ * @property {NS["formulas"]} [formulas]
+ * @property {number} cores
+ * @property {BitNodeMultipliers} bitnodeMultipliers
  */
-function hasFormulasAccess(ns) {
-  const formulas = getFormulasApi(ns);
-  return Boolean(formulas && formulas.hacking);
+
+class CalcContext {
+  /**
+   * @param {CalcContextOptions} options
+   */
+  constructor(options) {
+    /** @type {boolean} */
+    this.useFormulas = options.useFormulas;
+    
+    /** @type {NS["formulas"] | undefined} */
+    this.formulas = options.formulas;
+    
+    /** @type {Player | undefined} */
+    this.player = options.player;
+    
+    /** @type {BitNodeMultipliers} */
+    this.bitnodeMultipliers = options.bitnodeMultipliers;
+    
+    /** @type {number} */
+    this.cores = options.cores;
+  }
 }
 
 /**
  * Build calculation context for downstream helpers
  * @param {NS} ns
  * @param {boolean} enableFormulas
- * @returns {{useFormulas: boolean, player?: Player, formulas?: NS["formulas"], cores: number}}
+ * @returns {CalcContext}
  */
 function buildCalcContext(ns, enableFormulas) {
   if (!enableFormulas) {
-    return { useFormulas: false, cores: DEFAULT_ANALYSIS_CORES };
+    return { 
+      useFormulas: false, 
+      cores: DEFAULT_ANALYSIS_CORES,
+      bitnodeMultipliers: ns.getBitNodeMultipliers() 
+    };
   }
-  
+
   const formulas = getFormulasApi(ns);
   if (!formulas || !formulas.hacking) {
-    return { useFormulas: false, cores: DEFAULT_ANALYSIS_CORES };
+    return { 
+      useFormulas: false, 
+      cores: DEFAULT_ANALYSIS_CORES,
+      bitnodeMultipliers: ns.getBitNodeMultipliers() 
+    };
   }
-  
+
   return {
     useFormulas: true,
     formulas,
     player: ns.getPlayer(),
+    bitnodeMultipliers: ns.getBitNodeMultipliers(),
     cores: DEFAULT_ANALYSIS_CORES
   };
 }
@@ -106,7 +139,7 @@ function buildCalcContext(ns, enableFormulas) {
 function getAllTargetStates(ns, targetServers, runnerServers, calcContext) {
   const states = [];
   const inFlightThreads = getInFlightThreads(ns, runnerServers);
-  
+
   for (const target of targetServers) {
     // Only include targets we can actually hack
     if (ns.hasRootAccess(target)) {
@@ -116,10 +149,10 @@ function getAllTargetStates(ns, targetServers, runnerServers, calcContext) {
       }
     }
   }
-  
+
   // Sort by profit score descending
   states.sort((a, b) => b.profitScore - a.profitScore);
-  
+
   return states;
 }
 
@@ -134,9 +167,9 @@ function calculateAvailableThreads(ns, runner, scriptName) {
   const maxRam = ns.getServerMaxRam(runner);
   const usedRam = ns.getServerUsedRam(runner);
   const scriptRam = ns.getScriptRam(scriptName);
-  
+
   if (scriptRam === 0) return 0;
-  
+
   return Math.floor((maxRam - usedRam) / scriptRam);
 }
 
@@ -151,6 +184,36 @@ function deployWorkerScripts(ns, runnerServers) {
   }
 }
 
+let lastBackdoorWarning = 0;
+
+/**
+ * Attempt to spawn the backdoor script if not already running
+ * @param {NS} ns
+ * @returns {number} PID if launched, 0 if skipped/failed
+ */
+function trySpawnBackdoor(ns) {
+  // Don't spawn if we haven't bought nexus yet
+  if (ns.serverExists("nexus") === false) {
+    return 0;
+  }
+
+  // Don't spawn if already running
+  if (ns.isRunning(BACKDOOR_SCRIPT, "nexus")) {
+    return 0;
+  }
+
+  // Try to exec (will fail if not enough RAM)
+  const pid = ns.exec(BACKDOOR_SCRIPT, "nexus", 1);
+  if (pid > 0 && pid != "") {
+    logActivity(`🔑 Backdoor script started. pid: ${pid}`);
+  } else if (Date.now() - lastBackdoorWarning > BACKDOOR_WARN_COOLDOWN) {
+    ns.tprint("⚠️ WARN: Backdoor script failed to launch (insufficient RAM?) - manual backdoor may be needed");
+    lastBackdoorWarning = Date.now();
+  }
+  return pid;
+}
+
+
 /**
  * Add an entry to the activity log
  * @param {string} message
@@ -158,7 +221,7 @@ function deployWorkerScripts(ns, runnerServers) {
 function logActivity(message) {
   const timestamp = new Date().toLocaleTimeString();
   activityLog.unshift(`[${timestamp}] ${message}`);
-  
+
   // Keep log size bounded
   while (activityLog.length > MAX_ACTIVITY_LOG) {
     activityLog.pop();
@@ -187,14 +250,14 @@ function terminateShareTasks(ns, runnerServers) {
  * @param {string} action - "hack", "grow", or "weaken"
  * @param {string} target - target server name
  * @param {number} threads - number of threads
- * @param {{useFormulas: boolean}} calcContext
+ * @param {CalcContext} calcContext
  */
 function logTaskStart(ns, action, target, threads, calcContext) {
   const now = new Date();
   const useFormulas = calcContext?.useFormulas;
   const player = calcContext?.player;
   const serverSnapshot = useFormulas ? buildServerSnapshot(ns, target) : null;
-  
+
   // Get operation time
   let opTime;
   if (useFormulas && serverSnapshot && player) {
@@ -226,23 +289,25 @@ function logTaskStart(ns, action, target, threads, calcContext) {
         opTime = 0;
     }
   }
-  
+
   const completionTime = new Date(now.getTime() + opTime);
   const completionStr = completionTime.toLocaleTimeString();
-  
+
   // Calculate predicted outcome
   let outcomeStr = "";
   const currentMoney = ns.getServerMoneyAvailable(target);
   const maxMoney = ns.getServerMaxMoney(target);
   const currentSecurity = ns.getServerSecurityLevel(target);
   const minSecurity = ns.getServerMinSecurityLevel(target);
-  
+
   switch (action) {
     case "hack": {
       const hackPercent = useFormulas && serverSnapshot && player
-        ? calcContext.formulas.hacking.hackPercent(serverSnapshot, player)
+        ? ns.formulas.hacking.hackPercent(serverSnapshot, player)
         : ns.hackAnalyze(target);
-      const totalSteal = Math.min(1, hackPercent * threads);
+      const intelligence = ns.getPlayer().skills.intelligence
+      const intelligenceModGuess = intelligence / 10 + 1;
+      const totalSteal = Math.min(1, hackPercent * threads * intelligenceModGuess * calcContext.bitnodeMultipliers.ScriptHackMoney);
       const stolenAmount = currentMoney * totalSteal;
       outcomeStr = `→ $${ns.formatNumber(stolenAmount)}`;
       break;
@@ -276,11 +341,11 @@ function logTaskStart(ns, action, target, threads, calcContext) {
       break;
     }
   }
-  
+
   const timestamp = now.toLocaleTimeString();
   const message = `${action.toUpperCase()} ${target} (${threads}t) ${outcomeStr} @${completionStr}`;
   activityLog.unshift(`[${timestamp}] ${message}`);
-  
+
   // Keep log size bounded
   while (activityLog.length > MAX_ACTIVITY_LOG) {
     activityLog.pop();
@@ -296,21 +361,21 @@ function logTaskStart(ns, action, target, threads, calcContext) {
 function getRunningTasks(ns, runnerServers) {
   const tasks = new Map();
   const trackedScripts = [...WORKER_SCRIPTS, SHARE_SCRIPT];
-  
+
   for (const runner of runnerServers) {
     const processes = ns.ps(runner);
-    
+
     for (const proc of processes) {
       if (!trackedScripts.includes(proc.filename)) continue;
-      
+
       const action = proc.filename.replace('.js', '').toUpperCase();
       const target = proc.args[0];
       const key = target ? `${action} ${target}` : action;
-      
+
       tasks.set(key, (tasks.get(key) || 0) + proc.threads);
     }
   }
-  
+
   return tasks;
 }
 
@@ -324,9 +389,9 @@ function getRunningTasks(ns, runnerServers) {
 function calcWeakenThreadsNeeded(ns, target, predictedSecurity) {
   const minSecurity = ns.getServerMinSecurityLevel(target);
   const targetSecurity = minSecurity + SECURITY_THRESHOLD;
-  
+
   if (predictedSecurity <= targetSecurity) return 0;
-  
+
   const securityToRemove = predictedSecurity - targetSecurity;
   // Each weaken thread removes 0.05 security
   return Math.ceil(securityToRemove / 0.05);
@@ -342,21 +407,21 @@ function calcWeakenThreadsNeeded(ns, target, predictedSecurity) {
 function calcGrowThreadsNeeded(ns, target, predictedMoney, calcContext) {
   const maxMoney = ns.getServerMaxMoney(target);
   const targetMoney = maxMoney * MONEY_THRESHOLD;
-  
+
   if (predictedMoney >= targetMoney) return 0;
   if (predictedMoney <= 0) return 1000; // Need some baseline if money is 0
-  
+
   const multiplierNeeded = targetMoney / predictedMoney;
-  
+
   if (calcContext?.useFormulas) {
     const server = buildServerSnapshot(ns, target);
-    return estimateGrowThreadsWithFormulas(server, multiplierNeeded, calcContext);
+    return estimateGrowThreadsWithFormulas(ns, server, multiplierNeeded, calcContext);
   }
-  
+
   // Use ns.growthAnalyze to get threads needed for this multiplier
   // growthAnalyze(target, multiplier, cores) returns threads needed
   const threadsNeeded = Math.ceil(ns.growthAnalyze(target, multiplierNeeded));
-  
+
   return threadsNeeded;
 }
 
@@ -370,9 +435,9 @@ function calcGrowThreadsNeeded(ns, target, predictedMoney, calcContext) {
  */
 function calcHackThreadsNeeded(ns, target, predictedMoney, calcContext) {
   const maxMoney = ns.getServerMaxMoney(target);
-  
+
   if (predictedMoney <= 0) return 0;
-  
+
   // Aim to steal down to 25% of max (leaving room for grow cycle)
   const desiredFloor = maxMoney * 0.25;
   const hardFloor = maxMoney * MIN_MONEY_AFTER_HACK;
@@ -380,19 +445,19 @@ function calcHackThreadsNeeded(ns, target, predictedMoney, calcContext) {
   const maxStealable = predictedMoney - hardFloor;
   const desiredSteal = predictedMoney - targetMoney;
   const amountToSteal = Math.min(desiredSteal, maxStealable);
-  
+
   if (amountToSteal <= 0) return 0;
-  
+
   // hackAnalyze returns the fraction stolen per thread
   const hackPercent = calcContext?.useFormulas
     ? calcContext.formulas.hacking.hackPercent(buildServerSnapshot(ns, target), calcContext.player)
-    : ns.hackAnalyze(target);
+    : ns.hackAnalyze(target) * calcContext.bitnodeMultipliers.ScriptHackMoney;
   if (hackPercent <= 0) return 0;
-  
+
   // Each thread steals hackPercent of current money
   // We want: threads * hackPercent * predictedMoney >= amountToSteal
   const threadsNeeded = Math.ceil(amountToSteal / (hackPercent * predictedMoney));
-  
+
   return threadsNeeded;
 }
 
@@ -420,22 +485,27 @@ function calcMaxUsefulThreads(ns, target, priority, predictedMoney, predictedSec
 
 /**
  * Estimate grow threads using the formulas API via binary search
+ * @param {NS} ns
  * @param {Server} server
  * @param {number} multiplierNeeded
  * @param {{formulas: NS["formulas"], player: Player, cores: number}} calcContext
  * @returns {number}
  */
-function estimateGrowThreadsWithFormulas(server, multiplierNeeded, calcContext) {
-  const { formulas, player, cores } = calcContext;
-  
+function estimateGrowThreadsWithFormulas(ns, server, multiplierNeeded, calcContext) {
+  const { formulas, player, cores, bitnodeMultipliers } = calcContext;
+
+  //ns.tprint("estimating grow threads for server: ", server.hostname, " multiplier: ", multiplierNeeded, ", cores: ", cores);
+
+  return formulas.hacking.growThreads(server, player, server.moneyMax, cores)
+
   // Fast-path small multipliers
   if (multiplierNeeded <= 1) {
     return 0;
   }
-  
+
   let low = 1;
   let high = 1;
-  
+
   while (
     formulas.hacking.growPercent(server, high, player, cores) < multiplierNeeded &&
     high < 1_000_000
@@ -443,7 +513,7 @@ function estimateGrowThreadsWithFormulas(server, multiplierNeeded, calcContext) 
     low = high;
     high *= 2;
   }
-  
+
   let result = high;
   while (low <= high) {
     const mid = Math.floor((low + high) / 2);
@@ -455,7 +525,7 @@ function estimateGrowThreadsWithFormulas(server, multiplierNeeded, calcContext) 
       low = mid + 1;
     }
   }
-  
+
   return Math.max(1, result);
 }
 
@@ -467,24 +537,24 @@ function estimateGrowThreadsWithFormulas(server, multiplierNeeded, calcContext) 
  */
 function getInFlightThreads(ns, runnerServers) {
   const inFlight = new Map();
-  
+
   for (const runner of runnerServers) {
     const processes = ns.ps(runner);
-    
+
     for (const proc of processes) {
       if (!WORKER_SCRIPTS.includes(proc.filename)) continue;
-      
+
       const action = proc.filename.replace('.js', '');
       const target = proc.args[0];
-      
+
       if (!inFlight.has(target)) {
         inFlight.set(target, { hack: 0, grow: 0, weaken: 0 });
       }
-      
+
       inFlight.get(target)[action] += proc.threads;
     }
   }
-  
+
   return inFlight;
 }
 
@@ -503,7 +573,7 @@ function predictTargetState(ns, target, threads, calcContext) {
   const useFormulas = calcContext?.useFormulas;
   const player = calcContext?.player;
   const serverSnapshot = useFormulas ? buildServerSnapshot(ns, target) : null;
-  
+
   // Predict security changes
   // weaken reduces by 0.05 per thread
   // hack increases by 0.002 per thread
@@ -511,16 +581,16 @@ function predictTargetState(ns, target, threads, calcContext) {
   const securityFromWeaken = threads.weaken * 0.05;
   const securityFromHack = threads.hack * 0.002;
   const securityFromGrow = threads.grow * 0.004;
-  
+
   let predictedSecurity = currentSecurity - securityFromWeaken + securityFromHack + securityFromGrow;
   predictedSecurity = Math.max(minSecurity, predictedSecurity);
-  
+
   // Predict money changes
   // This is trickier - grow multiplier depends on server and threads
   // hack steals a percentage based on hackAnalyze
-  
+
   let predictedMoney = currentMoney;
-  
+
   // Estimate hack effect (each thread steals hackAnalyze % of current money)
   if (threads.hack > 0) {
     const hackPercent = useFormulas && serverSnapshot && player
@@ -532,7 +602,7 @@ function predictTargetState(ns, target, threads, calcContext) {
       serverSnapshot.moneyAvailable = predictedMoney;
     }
   }
-  
+
   // Estimate grow effect
   // growthAnalyze is tricky - it takes (target, growthMultiplier, cores) and returns threads needed
   // We need to estimate the other direction: given threads, what's the multiplier?
@@ -560,7 +630,7 @@ function predictTargetState(ns, target, threads, calcContext) {
       predictedMoney = Math.min(maxMoney, predictedMoney * growMultiplier);
     }
   }
-  
+
   return {
     predictedMoney: Math.max(0, predictedMoney),
     predictedSecurity
@@ -582,22 +652,22 @@ function assessTargetStateWithPrediction(ns, target, inFlightThreads, calcContex
   const hackChance = calcContext?.useFormulas
     ? calcContext.formulas.hacking.hackChance(buildServerSnapshot(ns, target), calcContext.player)
     : ns.hackAnalyzeChance(target);
-  
+
   // Get in-flight threads for this target
   const threads = inFlightThreads.get(target) || { hack: 0, grow: 0, weaken: 0 };
   const hasGrowInFlight = threads.grow > 0;
-  
+
   // Get predicted state after in-flight operations complete
   const { predictedMoney, predictedSecurity } = predictTargetState(ns, target, threads, calcContext);
-  
+
   const predictedMoneyPercent = maxMoney > 0 ? predictedMoney / maxMoney : 0;
   const predictedSecurityDelta = predictedSecurity - minSecurity;
-  
+
   // Current state (for display)
   const currentMoneyPercent = maxMoney > 0 ? currentMoney / maxMoney : 0;
   const currentSecurityDelta = currentSecurity - minSecurity;
   const currentSecurityMultiplier = currentSecurity / minSecurity;
-  
+
   // Determine priority based on PREDICTED state
   let priority;
   if (predictedSecurityDelta > SECURITY_THRESHOLD) {
@@ -608,16 +678,16 @@ function assessTargetStateWithPrediction(ns, target, inFlightThreads, calcContex
     priority = "hack";
   }
   const hackBlocked = priority === "hack" && hasGrowInFlight;
-  
+
   // Calculate profitability score using predicted values
   const profitScore = maxMoney * hackChance * (1 - predictedSecurityDelta / 100);
-  
+
   // Calculate max useful threads based on PREDICTED state (not current)
   // This tells us how many more threads we need to reach our thresholds
   const maxUsefulThreads = hackBlocked
     ? 0
     : calcMaxUsefulThreads(ns, target, priority, predictedMoney, predictedSecurity, calcContext);
-  
+
   return {
     server: target,
     priority,
@@ -648,6 +718,7 @@ function assessTargetStateWithPrediction(ns, target, inFlightThreads, calcContex
 /**
  * Assign tasks to fill available RAM (does not kill running scripts)
  * Respects thread caps per target and distributes across multiple targets
+ * Prioritizes high-core servers for worker tasks, any server for share tasks
  * @param {NS} ns
  * @param {object[]} targetStates
  * @param {string[]} runnerServers
@@ -656,90 +727,93 @@ function assessTargetStateWithPrediction(ns, target, inFlightThreads, calcContex
 function assignTasks(ns, targetStates, runnerServers, calcContext) {
   const newAssignments = [];
   let newThreads = { hack: 0, grow: 0, weaken: 0 };
-  
+
   // Track how many threads we've assigned to each target this cycle
   // (on top of what's already in-flight)
   const assignedThisCycle = new Map();
-  
+
   // Get script RAM costs
   const scriptRams = {
     hack: ns.getScriptRam("hack.js"),
     grow: ns.getScriptRam("grow.js"),
     weaken: ns.getScriptRam("weaken.js")
   };
-  
-  // Build a list of runners with their available RAM
-  const runnerRam = new Map();
+
+  // Build a list of runners with their available RAM and cores, sorted by cores descending
+  const runnerInfo = [];
   for (const runner of runnerServers) {
-    const available = ns.getServerMaxRam(runner) - ns.getServerUsedRam(runner);
+    let maxRam = ns.getServerMaxRam(runner);
+    const available = maxRam - ns.getServerUsedRam(runner);
+    const cores = ns.getServer(runner).cpuCores;
     if (available > 0) {
-      runnerRam.set(runner, available);
+      runnerInfo.push({ name: runner, ram: available, cores });
     }
   }
-  
+
+  // Sort by cores descending (high-core servers first)
+  runnerInfo.sort((a, b) => b.cores - a.cores);
+
   // Process targets in priority order (already sorted by profitScore)
   for (const target of targetStates) {
     const scriptName = target.priority + ".js";
     const scriptRam = scriptRams[target.priority];
-    
+
     if (scriptRam === 0) continue;
-    
+
     // Calculate how many more threads this target can use
     const key = `${target.priority}|${target.server}`;
     const alreadyAssignedThisCycle = assignedThisCycle.get(key) || 0;
     let remainingUseful = target.maxUsefulThreads - alreadyAssignedThisCycle;
-    
+
     if (remainingUseful <= 0) continue; // This target is saturated
-    
-    // Try to assign threads from each runner
-    for (const [runner, availableRam] of runnerRam) {
+
+    // Try to assign threads from each runner (high-core first)
+    for (const runner of runnerInfo) {
       if (remainingUseful <= 0) break;
-      
-      const maxThreadsFromRam = Math.floor(availableRam / scriptRam);
+
+      const maxThreadsFromRam = Math.floor(runner.ram / scriptRam);
       if (maxThreadsFromRam <= 0) continue;
-      
+
       // Assign the minimum of: what RAM allows, what's useful
       const threadsToAssign = Math.min(maxThreadsFromRam, remainingUseful);
-      
-      const pid = ns.exec(scriptName, runner, threadsToAssign, target.server);
-      
+
+      const pid = ns.exec(scriptName, runner.name, threadsToAssign, target.server);
+
       if (pid > 0) {
         newAssignments.push({
           script: scriptName,
-          runner,
+          runner: runner.name,
           threads: threadsToAssign,
           target: target.server,
           priority: target.priority,
           pid
         });
-        
+
         newThreads[target.priority] += threadsToAssign;
         remainingUseful -= threadsToAssign;
         assignedThisCycle.set(key, alreadyAssignedThisCycle + threadsToAssign);
-        
+
         // Update runner's available RAM
-        const newAvailable = availableRam - (threadsToAssign * scriptRam);
-        if (newAvailable > scriptRam) {
-          runnerRam.set(runner, newAvailable);
-        } else {
-          runnerRam.delete(runner);
+        runner.ram -= (threadsToAssign * scriptRam);
+        if (runner.ram <= scriptRam) {
+          runner.ram = 0; // Mark as exhausted
         }
       }
     }
   }
-  
+
   // Log new assignments aggregated by action+target
   const aggregated = new Map();
   for (const a of newAssignments) {
     const key = `${a.priority}|${a.target}`;
     aggregated.set(key, (aggregated.get(key) || 0) + a.threads);
   }
-  
+
   for (const [key, threads] of aggregated) {
     const [action, target] = key.split('|');
     logTaskStart(ns, action, target, threads, calcContext);
   }
-  
+
   return { newAssignments, newThreads };
 }
 
@@ -752,23 +826,23 @@ function assignTasks(ns, targetStates, runnerServers, calcContext) {
 function assignShareTasks(ns, runnerServers) {
   const scriptRam = ns.getScriptRam(SHARE_SCRIPT);
   if (scriptRam === 0) return 0;
-  
+
   let totalThreads = 0;
-  
+
   for (const runner of runnerServers) {
     const availableThreads = calculateAvailableThreads(ns, runner, SHARE_SCRIPT);
     if (availableThreads <= 0) continue;
-    
+
     const pid = ns.exec(SHARE_SCRIPT, runner, availableThreads);
     if (pid > 0) {
       totalThreads += availableThreads;
     }
   }
-  
+
   if (totalThreads > 0) {
     logActivity(`SHARE utilizing ${totalThreads} idle threads`);
   }
-  
+
   return totalThreads;
 }
 
@@ -782,12 +856,12 @@ function assignShareTasks(ns, runnerServers) {
  */
 function printStatus(ns, targetStates, runnerServers, taskSummary, includeHome) {
   ns.clearLog();
-  
+
   ns.print("═══════════════════════════════════════════");
   ns.print("           DISTRIBUTED ORCHESTRATOR        ");
   ns.print("═══════════════════════════════════════════");
   ns.print("");
-  
+
   // Runner summary
   let totalRam = 0;
   let usedRam = 0;
@@ -797,23 +871,29 @@ function printStatus(ns, targetStates, runnerServers, taskSummary, includeHome) 
   }
   const homeStatus = includeHome ? "" : " (home excluded)";
   ns.print(`🖥️  Runners: ${runnerServers.length}${homeStatus} | RAM: ${usedRam.toFixed(0)}/${totalRam.toFixed(0)} GB`);
-  
+
+  // Show which reserved server exists (if any)
+  const existingReserved = RESERVED_SERVERS.find(s => ns.serverExists(s));
+  if (existingReserved) {
+    ns.print(`🚫 Reserved: ${existingReserved} (excluded from orchestration)`);
+  }
+
   // Get all currently running tasks
   const runningTasks = getRunningTasks(ns, runnerServers);
-  
+
   // Tally total threads by action type
   let totalByAction = { HACK: 0, GROW: 0, WEAKEN: 0, SHARE: 0 };
   for (const [key, threads] of runningTasks) {
     const action = key.split(' ')[0];
     totalByAction[action] = (totalByAction[action] || 0) + threads;
   }
-  
+
   ns.print(`📊 Running: H:${totalByAction.HACK || 0} G:${totalByAction.GROW || 0} W:${totalByAction.WEAKEN || 0} S:${totalByAction.SHARE || 0}`);
   if (taskSummary.shareThreads > 0) {
     ns.print(`♻️  Share threads launched this cycle: +${taskSummary.shareThreads}`);
   }
   ns.print("");
-  
+
   // Top targets with current priorities
   ns.print("─── TOP TARGETS (priority based on prediction) ───");
   const topTargets = targetStates.slice(0, 21);
@@ -824,7 +904,7 @@ function printStatus(ns, targetStates, runnerServers, taskSummary, includeHome) 
     const capStr = t.maxUsefulThreads > 0 ? `need:${t.maxUsefulThreads}t` : "✓ full";
     ns.print(`${actionIcon} ${t.server}: $${moneyStr} | ${secStr} extra security | ${capStr}`);
   }
-  
+
   // Currently running tasks
   ns.print("");
   ns.print("─── RUNNING TASKS ───");
@@ -840,7 +920,7 @@ function printStatus(ns, targetStates, runnerServers, taskSummary, includeHome) 
       ns.print(`  ... and ${sorted.length - 8} more`);
     }
   }
-  
+
   // Recent activity log
   ns.print("");
   ns.print("─── RECENT ACTIVITY ───");
@@ -851,31 +931,58 @@ function printStatus(ns, targetStates, runnerServers, taskSummary, includeHome) 
       ns.print(`  ${entry}`);
     }
   }
-  
+
   ns.print("");
   ns.print(`Last update: ${new Date().toLocaleTimeString()}`);
+}
+
+/** @param {NS} ns */
+function getReservedServers(ns) {
+  let readyServers = [];
+  for (let i = 0; i< RESERVED_SERVERS.length; i++) {
+    if (!ns.serverExists(RESERVED_SERVERS[i])) {
+      continue;
+    }
+    const server = ns.getServer(RESERVED_SERVERS[i]);
+    if (server.maxRam >= 1024) {
+      readyServers.push(RESERVED_SERVERS[i])
+    }
+  }
+  return readyServers;
 }
 
 /** @param {NS} ns */
 export async function main(ns) {
   ns.disableLog("ALL");
   ns.tail();
-  
+
   const flags = parseArgs(ns);
   const includeHome = !flags.ignoreHome;
-  
+
   ns.print("Starting Distributed Orchestrator...");
   ns.print(`  Home RAM: ${includeHome ? "ENABLED" : "DISABLED (-H)"}`);
+  ns.print(`  Reserved Servers: ${getReservedServers(ns).join(", ")} (reserved when RAM reaches usable level)`);
   ns.print("");
-  
+
+  // Check for duplicate nexus situation
+  const hasNexus = ns.serverExists("nexus");
+  const hasNexus0 = ns.serverExists("nexus-0");
+
+  if (hasNexus && hasNexus0) {
+    ns.print("⚠️  WARNING: Duplicate nexus servers detected!");
+    ns.print("Both 'nexus' and 'nexus-0' exist - both will be excluded from orchestration");
+    ns.print("Consider deleting one to free up a server slot.");
+    ns.print("");
+  }
+
   while (true) {
-    const calcContext = buildCalcContext(ns, flags.useFormulas);
+    const calcContext = buildCalcContext(ns, true);
     if (flags.useFormulas && !calcContext.useFormulas) {
       ns.print("⚠️  Formulas requested (-F) but API unavailable. Falling back to vanilla sims.");
     }
     // 1. Scan network
     const allServers = getAllServers(ns);
-    
+
     // 2. Try to nuke everything
     for (const server of allServers) {
       const hadRoot = ns.hasRootAccess(server);
@@ -883,29 +990,35 @@ export async function main(ns) {
         logActivity(`Gained root on ${server}`);
       }
     }
-    
+
+    // 2.5 Attempt to run backdoor script (fails gracefully if insufficient RAM)
+    trySpawnBackdoor(ns);
+
     // 3. Categorize servers (pass includeHome flag)
-    const { targetServers, runnerServers } = categorizeServers(ns, allServers, includeHome);
-    
-    // 4. Deploy worker scripts
+    let { targetServers, runnerServers } = categorizeServers(ns, allServers, includeHome);
+
+    // 4. Filter out reserved servers from runners
+    runnerServers = runnerServers.filter(s => !getReservedServers(ns).includes(s));
+
+    // 5. Deploy worker scripts
     deployWorkerScripts(ns, runnerServers);
-    
-    // 5. Reclaim RAM used by previous share cycles
+
+    // 6. Reclaim RAM used by previous share cycles
     terminateShareTasks(ns, runnerServers);
-    
-    // 6. Assess all targets (with prediction based on in-flight tasks)
+
+    // 7. Assess all targets (with prediction based on in-flight tasks)
     const targetStates = getAllTargetStates(ns, targetServers, runnerServers, calcContext);
-    
-    // 7. Assign and execute tasks
+
+    // 8. Assign and execute tasks
     const taskSummary = assignTasks(ns, targetStates, runnerServers, calcContext);
-    
-    // 8. Fill remaining RAM with share scripts
+
+    // 9. Fill remaining RAM with share scripts
     taskSummary.shareThreads = assignShareTasks(ns, runnerServers);
-    
-    // 9. Print status
+
+    // 10. Print status
     printStatus(ns, targetStates, runnerServers, taskSummary, includeHome);
-    
-    // 10. Wait before next cycle
+
+    // 11. Wait before next cycle
     await ns.sleep(CYCLE_DELAY);
   }
 }

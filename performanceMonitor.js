@@ -293,13 +293,14 @@ export async function main(ns) {
         ns.print("Symbol | Side  | Shares | Avg Px | Curr Px | Δ if Exit | Forecast");
         ns.print("----------------------------------------------------------------");
         for (const pos of heldPositions) {
+          const trueDelta = pos.delta * (pos.side === "SHORT" ? -1 : 1);
           const line = [
             pos.symbol.padEnd(6),
             pos.side.padEnd(5),
             pos.shares.toString().padStart(6),
             ns.formatNumber(pos.avg, 2).padStart(8),
             ns.formatNumber(pos.price, 2).padStart(8),
-            `${pos.delta >= 0 ? "+" : ""}$${ns.formatNumber(pos.delta, 2)}`.padStart(12),
+            `${trueDelta >= 0 ? "+" : ""}$${ns.formatNumber(trueDelta, 2)}`.padStart(12),
             `${(pos.forecast * 100).toFixed(1)}%`.padStart(7)
           ].join(" | ");
           ns.print(line);

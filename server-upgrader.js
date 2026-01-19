@@ -2,6 +2,8 @@
 
 const MIN_RAM = 2;        // Minimum RAM for new servers (2GB)
 const CYCLE_DELAY = 5000; // 5 seconds between cycles
+const NEXUS_NAME = "nexus"; // Name for the first purchased server
+const NEXUS_TARGET_RAM = 1024; // Minimum RAM before nexus is considered "ready"
 
 /**
  * Get the next RAM tier (double current)
@@ -13,8 +15,77 @@ function getNextRamTier(currentRam) {
 }
 
 /**
+ * Recursively get all files and directories from a path
+ * @param {NS} ns
+ * @param {string} path
+ * @returns {string[]} Array of file paths
+ */
+function getAllFiles(ns, path = "/") {
+  const files = [];
+  const items = ns.ls("home", path);
+  
+  for (const item of items.filter(i => i.endsWith(".js"))) {
+    
+    files.push(item);
+  }
+  
+  return files;
+}
+
+/**
+ * Set up the nexus server with all home scripts
+ * @param {NS} ns
+ * @param {string} nexusServer
+ */
+function setupNexusServer(ns, nexusServer) {
+  ns.print(`[NEXUS] Setting up ${nexusServer} as auxiliary script host...`);
+  
+  // Get all files from home
+  const allFiles = getAllFiles(ns);
+  
+  ns.print(`[NEXUS] Found ${allFiles.length} files to copy`);
+  
+  // Copy all files to nexus
+  const success = ns.scp(allFiles, nexusServer, "home");
+  
+  if (success) {
+    ns.print(`[NEXUS] ✅ Successfully copied all scripts to ${nexusServer}`);
+    ns.print(`[NEXUS] ${nexusServer} is now ready to run auxiliary scripts`);
+  } else {
+    ns.print(`[NEXUS] ⚠️  Some files may not have copied successfully`);
+  }
+}
+
+/**
+ * Get the nexus server name (might be "nexus" or "nexus-0" depending on game version)
+ * @param {NS} ns
+ * @returns {string|null} The actual nexus server name, or null if not found
+ */
+function findNexusServer(ns) {
+  const servers = ns.getPurchasedServers();
+  
+  // Check for exact match first
+  if (servers.includes(NEXUS_NAME)) {
+    return NEXUS_NAME;
+  }
+  
+  // Check for numbered variant (nexus-0)
+  if (servers.includes(`${NEXUS_NAME}-0`)) {
+    return `${NEXUS_NAME}-0`;
+  }
+  
+  // If we have exactly 1 server and it starts with our prefix, assume it's nexus
+  if (servers.length === 1 && servers[0].startsWith(NEXUS_NAME)) {
+    return servers[0];
+  }
+  
+  return null;
+}
+
+/**
  * Find the best action to take with available money
  * Returns either a purchase action, upgrade action, or null if nothing affordable
+ * Priority: Upgrade nexus to target RAM first, then optimize cost/RAM for everything else
  * @param {NS} ns
  * @returns {{type: "buy"|"upgrade", cost: number, ram: number, server?: string} | null}
  */
@@ -24,6 +95,33 @@ function findBestAction(ns) {
   const maxServers = ns.getPurchasedServerLimit();
   const maxRam = ns.getPurchasedServerMaxRam();
   
+  // Check if nexus exists and needs upgrading
+  const nexusServer = findNexusServer(ns);
+  if (nexusServer) {
+    const nexusRam = ns.getServerMaxRam(nexusServer);
+    
+    // If nexus is below target RAM, prioritize upgrading it
+    if (nexusRam < NEXUS_TARGET_RAM && nexusRam < maxRam) {
+      const nextRam = getNextRamTier(nexusRam);
+      const upgradeCost = ns.getPurchasedServerUpgradeCost(nexusServer, nextRam);
+      
+      if (upgradeCost <= money && upgradeCost > 0) {
+        return {
+          type: "upgrade",
+          cost: upgradeCost,
+          ram: nextRam,
+          server: nexusServer,
+          currentRam: nexusRam,
+          priority: true  // Mark as priority upgrade
+        };
+      }
+      
+      // Can't afford nexus upgrade yet, return null to wait
+      return null;
+    }
+  }
+  
+  // Nexus is ready (or doesn't exist yet), proceed with normal cost/RAM optimization
   let bestAction = null;
   let bestCostPerRam = Infinity;
   
@@ -87,42 +185,6 @@ function getTotalPurchasedRam(ns) {
 }
 
 /**
- * Calculate how much money is required to finish upgrading owned servers
- * and acquire remaining slots at max RAM
- * @param {NS} ns
- * @returns {{existing: number, missing: number, total: number}}
- */
-function getRemainingUpgradeCost(ns) {
-  const servers = ns.getPurchasedServers();
-  const maxServers = ns.getPurchasedServerLimit();
-  const maxRam = ns.getPurchasedServerMaxRam();
-  let existingCost = 0;
-
-  for (const server of servers) {
-    let currentRam = ns.getServerMaxRam(server);
-    while (currentRam < maxRam) {
-      const nextRam = Math.min(maxRam, getNextRamTier(currentRam));
-      const upgradeCost = ns.getPurchasedServerUpgradeCost(server, nextRam);
-      if (!isFinite(upgradeCost) || upgradeCost <= 0) {
-        break;
-      }
-      existingCost += upgradeCost;
-      currentRam = nextRam;
-    }
-  }
-
-  const remainingSlots = Math.max(0, maxServers - servers.length);
-  const costPerMaxServer = ns.getPurchasedServerCost(maxRam);
-  const missingCost = remainingSlots * costPerMaxServer;
-
-  return {
-    existing: existingCost,
-    missing: missingCost,
-    total: existingCost + missingCost
-  };
-}
-
-/**
  * Print current status
  * @param {NS} ns
  */
@@ -134,7 +196,7 @@ function printStatus(ns) {
   const money = ns.getServerMoneyAvailable("home");
   const totalRam = getTotalPurchasedRam(ns);
   const maxRam = ns.getPurchasedServerMaxRam();
-  const remainingCost = getRemainingUpgradeCost(ns);
+  const nexusServer = findNexusServer(ns);
   
   ns.print("═══════════════════════════════════════════");
   ns.print("            SERVER UPGRADER                ");
@@ -143,11 +205,14 @@ function printStatus(ns) {
   ns.print(`💰 Available: $${ns.formatNumber(money)}`);
   ns.print(`🖥️  Servers: ${servers.length}/${maxServers}`);
   ns.print(`📊 Total RAM: ${ns.formatNumber(totalRam)} GB`);
-  ns.print(`💸 Needed (owned → max): $${ns.formatNumber(remainingCost.existing)}`);
-  if (remainingCost.missing > 0) {
-    ns.print(`💸 Needed (missing max-tier servers): $${ns.formatNumber(remainingCost.missing)}`);
+  
+  if (nexusServer) {
+    const nexusRam = ns.getServerMaxRam(nexusServer);
+    const nexusReady = nexusRam >= NEXUS_TARGET_RAM;
+    const statusIcon = nexusReady ? "✅" : "⏳";
+    const statusText = nexusReady ? "READY" : `${ns.formatNumber(nexusRam)}/${ns.formatNumber(NEXUS_TARGET_RAM)} GB`;
+    ns.print(`${statusIcon} Nexus (${nexusServer}): ${statusText}`);
   }
-  ns.print(`💵 Total to finish: $${ns.formatNumber(remainingCost.total)}`);
   ns.print("");
   
   // Show each server's RAM
@@ -176,9 +241,11 @@ function printStatus(ns) {
   const nextAction = findBestAction(ns);
   if (nextAction) {
     if (nextAction.type === "buy") {
-      ns.print(`  BUY new server (${nextAction.ram} GB) for $${ns.formatNumber(nextAction.cost)}`);
+      const serverName = servers.length === 0 ? NEXUS_NAME : `pserv-${servers.length}`;
+      ns.print(`  BUY new server "${serverName}" (${nextAction.ram} GB) for $${ns.formatNumber(nextAction.cost)}`);
     } else {
-      ns.print(`  UPGRADE ${nextAction.server}: ${ns.formatNumber(nextAction.currentRam)}→${ns.formatNumber(nextAction.ram)} GB`);
+      const priorityTag = nextAction.priority ? " [PRIORITY]" : "";
+      ns.print(`  UPGRADE ${nextAction.server}: ${ns.formatNumber(nextAction.currentRam)}→${ns.formatNumber(nextAction.ram)} GB${priorityTag}`);
       ns.print(`  Cost: $${ns.formatNumber(nextAction.cost)}`);
     }
   } else if (servers.length >= maxServers) {
@@ -197,6 +264,15 @@ function printStatus(ns) {
     }
   } else {
     ns.print("  ⏳ Waiting for funds...");
+    // If we're waiting and nexus isn't ready, show what we're waiting for
+    if (nexusServer) {
+      const nexusRam = ns.getServerMaxRam(nexusServer);
+      if (nexusRam < NEXUS_TARGET_RAM) {
+        const nextRam = getNextRamTier(nexusRam);
+        const cost = ns.getPurchasedServerUpgradeCost(nexusServer, nextRam);
+        ns.print(`  Need $${ns.formatNumber(cost)} to upgrade ${nexusServer} to ${ns.formatNumber(nextRam)} GB`);
+      }
+    }
   }
   
   ns.print("");
@@ -209,24 +285,104 @@ export async function main(ns) {
   ns.tail();
   
   ns.print("Starting Server Upgrader...");
+  ns.print(`First server will be named: ${NEXUS_NAME} (may appear as ${NEXUS_NAME}-0)`);
+  ns.print(`Nexus target RAM: ${NEXUS_TARGET_RAM} GB`);
+  ns.print("");
   
-  let serverIndex = ns.getPurchasedServers().length;
+  // Check for duplicate nexus situation
+  const servers = ns.getPurchasedServers();
+  const hasNexus = servers.includes(NEXUS_NAME);
+  const hasNexus0 = servers.includes(`${NEXUS_NAME}-0`);
+  
+  if (hasNexus && hasNexus0) {
+    ns.print("⚠️  WARNING: Duplicate nexus servers detected!");
+    ns.print(`Found both "${NEXUS_NAME}" and "${NEXUS_NAME}-0"`);
+    ns.print("");
+    ns.print("Recommended fix:");
+    ns.print(`1. Note which one has your scripts/processes running`);
+    ns.print(`2. Run: killall; ns.deleteServer("${NEXUS_NAME}") or ns.deleteServer("${NEXUS_NAME}-0")`);
+    ns.print(`3. Restart this script`);
+    ns.print("");
+    ns.print("Continuing anyway - will treat both as nexus...");
+    ns.print("");
+  }
+  
+  let serverIndex = 0;
+  let nexusSetupComplete = false;
+  let nexusScriptsLaunched = false;
   
   while (true) {
+    // Check if nexus just became ready and we haven't launched scripts yet
+    const servers = ns.getPurchasedServers();
+    const nexusServer = findNexusServer(ns);
+    
+    if (nexusServer && !nexusScriptsLaunched) {
+      const nexusRam = ns.getServerMaxRam(nexusServer);
+      
+      if (nexusRam >= NEXUS_TARGET_RAM) {
+        ns.print("");
+        ns.print("═══════════════════════════════════════════");
+        ns.print("🎉 NEXUS IS READY!");
+        ns.print("═══════════════════════════════════════════");
+        ns.print(`${nexusServer} has reached ${ns.formatNumber(nexusRam)} GB RAM`);
+        ns.print("");
+        ns.print("You can now run auxiliary scripts on nexus:");
+        ns.print("  - Stock trader (~37 GB)");
+        ns.print("  - Aug finder (~26 GB)");
+        ns.print("  - Sleeve manager (~50-60 GB)");
+        ns.print("");
+        ns.print("Example commands:");
+        ns.print(`  run stock-trader.js --tail`);
+        ns.print(`  run find-aug-utility.js --tail`);
+        ns.print(`  run sleeve-manager.js --tail`);
+        ns.print("");
+        ns.exec("nexus.js", "nexus", 1);
+        nexusScriptsLaunched = true;
+      }
+    }
+    
     // Find and execute the best action
     const action = findBestAction(ns);
     
     if (action) {
       if (action.type === "buy") {
-        const hostname = ns.purchaseServer(`pserv-${serverIndex}`, action.ram);
+        // Determine server name based on whether we already have a nexus
+        const existingNexus = findNexusServer(ns);
+        let desiredName;
+        
+        if (!existingNexus) {
+          // First server ever - this is nexus
+          desiredName = NEXUS_NAME;
+        } else {
+          // We have nexus, so name by total server count (not serverIndex)
+          desiredName = `pserv-${servers.length}`;
+        }
+        
+        const hostname = ns.purchaseServer(desiredName, action.ram);
+        
         if (hostname) {
           ns.print(`[+] Purchased ${hostname} with ${action.ram} GB RAM`);
+          
+          // If this is nexus (first time we see it), set it up
+          if (!nexusSetupComplete && (hostname === NEXUS_NAME || hostname.startsWith(NEXUS_NAME))) {
+            await ns.sleep(100); // Brief delay to ensure server is ready
+            setupNexusServer(ns, hostname);
+            nexusSetupComplete = true;
+          }
+          
           serverIndex++;
         }
       } else if (action.type === "upgrade") {
         const success = ns.upgradePurchasedServer(action.server, action.ram);
         if (success) {
           ns.print(`[+] Upgraded ${action.server} to ${ns.formatNumber(action.ram)} GB RAM`);
+          
+          // If we upgraded nexus, refresh its files
+          const currentNexus = findNexusServer(ns);
+          if (action.server === currentNexus) {
+            await ns.sleep(100);
+            setupNexusServer(ns, currentNexus);
+          }
         }
       }
     }
@@ -235,7 +391,6 @@ export async function main(ns) {
     printStatus(ns);
     
     // Check if we're done (all servers at max RAM)
-    const servers = ns.getPurchasedServers();
     const maxServers = ns.getPurchasedServerLimit();
     const maxRam = ns.getPurchasedServerMaxRam();
     
@@ -250,6 +405,10 @@ export async function main(ns) {
       if (allMaxed) {
         ns.print("");
         ns.print("🎉 All servers purchased and maxed out!");
+        const finalNexus = findNexusServer(ns);
+        if (finalNexus) {
+          ns.print(`🎯 ${finalNexus} is ready for auxiliary scripts`);
+        }
         ns.print("Script complete.");
         return;
       }
