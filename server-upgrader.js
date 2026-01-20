@@ -3,8 +3,17 @@
 const MIN_RAM = 2;        // Minimum RAM for new servers (2GB)
 const CYCLE_DELAY = 5000; // 5 seconds between cycles
 const NEXUS_NAME = "nexus"; // Name for the first purchased server
-const NEXUS_TARGET_RAM = 2048; // Minimum RAM before nexus is considered "ready"
+const NEXUS_TARGET_RAM = 512; // Minimum RAM before nexus is considered "ready"
 
+/**
+ * Get target ram based on singularity cost (nexus scripts are singularity heavy)
+ * @param {NS} ns
+ */
+export function getNexusTargetRam(ns) {
+  const singularitySourceFileLevel = ns.getResetInfo().ownedSF[4];
+  const multiplier = ns.getResetInfo().currentNode === 4 ? 1 : singularitySourceFileLevel === 1 ? 4 : singularitySourceFileLevel === 2 ? 4 : singularitySourceFileLevel === 3 ? 2 : undefined;
+  return NEXUS_TARGET_RAM * multiplier;
+}
 /**
  * Get the next RAM tier (double current)
  * @param {number} currentRam
@@ -101,7 +110,7 @@ function findBestAction(ns) {
     const nexusRam = ns.getServerMaxRam(nexusServer);
     
     // If nexus is below target RAM, prioritize upgrading it
-    if (nexusRam < NEXUS_TARGET_RAM && nexusRam < maxRam) {
+    if (nexusRam < getNexusTargetRam(ns) && nexusRam < maxRam) {
       const nextRam = getNextRamTier(nexusRam);
       const upgradeCost = ns.getPurchasedServerUpgradeCost(nexusServer, nextRam);
       
@@ -150,6 +159,10 @@ function findBestAction(ns) {
     if (nextRam > maxRam) continue;
     
     const upgradeCost = ns.getPurchasedServerUpgradeCost(server, nextRam);
+    if (upgradeCost > getMaxServerCost(ns)) {
+      ns.ui.closeTail();
+      ns.exit();
+    }
     if (upgradeCost <= money && upgradeCost > 0) {
       const ramGain = nextRam - currentRam;
       const costPerRam = upgradeCost / ramGain;
@@ -208,9 +221,9 @@ function printStatus(ns) {
   
   if (nexusServer) {
     const nexusRam = ns.getServerMaxRam(nexusServer);
-    const nexusReady = nexusRam >= NEXUS_TARGET_RAM;
+    const nexusReady = nexusRam >= getNexusTargetRam(ns);
     const statusIcon = nexusReady ? "✅" : "⏳";
-    const statusText = nexusReady ? "READY" : `${ns.formatNumber(nexusRam)}/${ns.formatNumber(NEXUS_TARGET_RAM)} GB`;
+    const statusText = nexusReady ? "READY" : `${ns.formatNumber(nexusRam)}/${ns.formatNumber(getNexusTargetRam(ns))} GB`;
     ns.print(`${statusIcon} Nexus (${nexusServer}): ${statusText}`);
   }
   ns.print("");
@@ -267,7 +280,7 @@ function printStatus(ns) {
     // If we're waiting and nexus isn't ready, show what we're waiting for
     if (nexusServer) {
       const nexusRam = ns.getServerMaxRam(nexusServer);
-      if (nexusRam < NEXUS_TARGET_RAM) {
+      if (nexusRam < getNexusTargetRam(ns)) {
         const nextRam = getNextRamTier(nexusRam);
         const cost = ns.getPurchasedServerUpgradeCost(nexusServer, nextRam);
         ns.print(`  Need $${ns.formatNumber(cost)} to upgrade ${nexusServer} to ${ns.formatNumber(nextRam)} GB`);
@@ -279,6 +292,16 @@ function printStatus(ns) {
   ns.print(`Last update: ${new Date().toLocaleTimeString()}`);
 }
 
+//stop buying servers when they're more expensive than a hacking tool we don't have yet
+/** @param {NS} ns */
+function getMaxServerCost(ns) {
+  if (!ns.fileExists("SQLInject.exe", 'home')) {
+    return ns.singularity.getDarkwebProgramCost("SQLInject.exe");
+  } else {
+    return 1e9;
+  }
+}
+
 /** @param {NS} ns */
 export async function main(ns) {
   ns.disableLog("ALL");
@@ -286,7 +309,7 @@ export async function main(ns) {
   
   ns.print("Starting Server Upgrader...");
   ns.print(`First server will be named: ${NEXUS_NAME} (may appear as ${NEXUS_NAME}-0)`);
-  ns.print(`Nexus target RAM: ${NEXUS_TARGET_RAM} GB`);
+  ns.print(`Nexus target RAM: ${getNexusTargetRam(ns)} GB`);
   ns.print("");
   
   // Check for duplicate nexus situation
@@ -319,7 +342,7 @@ export async function main(ns) {
     if (nexusServer && !nexusScriptsLaunched) {
       const nexusRam = ns.getServerMaxRam(nexusServer);
       
-      if (nexusRam >= NEXUS_TARGET_RAM) {
+      if (nexusRam >= getNexusTargetRam(ns)) {
         ns.print("");
         ns.print("═══════════════════════════════════════════");
         ns.print("🎉 NEXUS IS READY!");
@@ -336,9 +359,9 @@ export async function main(ns) {
         ns.print(`  run find-aug-utility.js --tail`);
         ns.print(`  run sleeve-manager.js --tail`);
         ns.print("");
+        ns.killall("nexus", true);
         ns.exec("nexus.js", "nexus", 1);
         nexusScriptsLaunched = true;
-        ns.exit();
       }
     }
     

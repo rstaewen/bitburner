@@ -2,6 +2,7 @@
 
 import { getAllServers, categorizeServers } from "/utils/scanner.js";
 import { tryNuke } from "/utils/nuker.js";
+import { getNexusTargetRam } from "server-upgrader.js"
 
 const BACKDOOR_WARN_COOLDOWN = 300000; // 5 minutes
 const BACKDOOR_SCRIPT = "utils/backdoor-sluts.js"
@@ -143,7 +144,7 @@ async function writeOrchestratorInfo(ns, shareThreads, totalThreads, hackingThre
   
   await ns.write(INFO_FILE, JSON.stringify(info), 'w');
   const existingReserved = RESERVED_SERVERS.find(s => ns.serverExists(s));
-  if (existingReserved !== null) {
+  if (existingReserved !== undefined) {
     ns.scp(INFO_FILE, existingReserved);
   }
 }
@@ -936,7 +937,7 @@ function getReservedServers(ns) {
       continue;
     }
     const server = ns.getServer(RESERVED_SERVERS[i]);
-    if (server.maxRam >= 1024) {
+    if (server.maxRam >= getNexusTargetRam(ns)) {
       readyServers.push(RESERVED_SERVERS[i])
     }
   }
