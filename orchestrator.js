@@ -14,6 +14,7 @@ const CYCLE_DELAY = 10000;         // 10 seconds between cycles
 const MAX_ACTIVITY_LOG = 8;        // How many recent activities to show
 const DEFAULT_ANALYSIS_CORES = 1;  // Assume single-core scripts for planning estimates
 const RESERVED_SERVERS = ["nexus", "nexus-0"];   // Servers reserved for auxiliary scripts
+const INFO_FILE = '/data/orchestrator-info.json';
 
 // Persistent activity log (survives across cycles)
 const activityLog = [];
@@ -127,6 +128,20 @@ function buildCalcContext(ns, enableFormulas) {
     bitnodeMultipliers: ns.getBitNodeMultipliers(),
     cores: DEFAULT_ANALYSIS_CORES
   };
+}
+
+// In your main loop, after calculating thread allocations, write the info:
+async function writeOrchestratorInfo(ns, shareThreads, totalThreads, hackingThreads) {
+  const info = {
+    timestamp: Date.now(),
+    shareThreads: shareThreads,
+    totalThreads: totalThreads,
+    hackingThreads: hackingThreads,
+    shareRatio: totalThreads > 0 ? shareThreads / totalThreads : 0,
+    // Add any other useful metrics
+  };
+  
+  await ns.write(INFO_FILE, JSON.stringify(info), 'w');
 }
 
 /**
@@ -497,36 +512,6 @@ function estimateGrowThreadsWithFormulas(ns, server, multiplierNeeded, calcConte
   //ns.tprint("estimating grow threads for server: ", server.hostname, " multiplier: ", multiplierNeeded, ", cores: ", cores);
 
   return formulas.hacking.growThreads(server, player, server.moneyMax, cores)
-
-  // Fast-path small multipliers
-  if (multiplierNeeded <= 1) {
-    return 0;
-  }
-
-  let low = 1;
-  let high = 1;
-
-  while (
-    formulas.hacking.growPercent(server, high, player, cores) < multiplierNeeded &&
-    high < 1_000_000
-  ) {
-    low = high;
-    high *= 2;
-  }
-
-  let result = high;
-  while (low <= high) {
-    const mid = Math.floor((low + high) / 2);
-    const multiplier = formulas.hacking.growPercent(server, mid, player, cores);
-    if (multiplier >= multiplierNeeded) {
-      result = mid;
-      high = mid - 1;
-    } else {
-      low = mid + 1;
-    }
-  }
-
-  return Math.max(1, result);
 }
 
 /**
@@ -854,7 +839,7 @@ function assignShareTasks(ns, runnerServers) {
  * @param {object} taskSummary
  * @param {boolean} includeHome
  */
-function printStatus(ns, targetStates, runnerServers, taskSummary, includeHome) {
+async function printStatus(ns, targetStates, runnerServers, taskSummary, includeHome) {
   ns.clearLog();
 
   ns.print("═══════════════════════════════════════════");
@@ -934,6 +919,9 @@ function printStatus(ns, targetStates, runnerServers, taskSummary, includeHome) 
 
   ns.print("");
   ns.print(`Last update: ${new Date().toLocaleTimeString()}`);
+
+  // Log assignment info
+  await writeOrchestratorInfo(ns, totalByAction.SHARE, totalByAction.HACK + totalByAction.WEAKEN + totalByAction.GROW + totalByAction.SHARE, totalByAction.HACK || 0);
 }
 
 /** @param {NS} ns */
@@ -1016,7 +1004,7 @@ export async function main(ns) {
     taskSummary.shareThreads = assignShareTasks(ns, runnerServers);
 
     // 10. Print status
-    printStatus(ns, targetStates, runnerServers, taskSummary, includeHome);
+    await printStatus(ns, targetStates, runnerServers, taskSummary, includeHome);
 
     // 11. Wait before next cycle
     await ns.sleep(CYCLE_DELAY);

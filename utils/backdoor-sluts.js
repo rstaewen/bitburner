@@ -88,12 +88,6 @@ async function backdoorServer(ns, target) {
   ns.singularity.connect("home");
 
   ns.tprint(`SUCCESS: Backdoored ${target}`);
-  await ns.sleep(1000);
-  const invitations = ns.singularity.checkFactionInvitations();
-  for (let i = 0; i< invitations.length; i++) {
-    ns.tprint(`SUCCESS: Attempting to join: ${invitations[i]}`);
-    ns.singularity.joinFaction(invitations[i]);
-  }
   return true;
 }
 

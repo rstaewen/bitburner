@@ -3,7 +3,7 @@
 const MIN_RAM = 2;        // Minimum RAM for new servers (2GB)
 const CYCLE_DELAY = 5000; // 5 seconds between cycles
 const NEXUS_NAME = "nexus"; // Name for the first purchased server
-const NEXUS_TARGET_RAM = 1024; // Minimum RAM before nexus is considered "ready"
+const NEXUS_TARGET_RAM = 2048; // Minimum RAM before nexus is considered "ready"
 
 /**
  * Get the next RAM tier (double current)
@@ -338,6 +338,7 @@ export async function main(ns) {
         ns.print("");
         ns.exec("nexus.js", "nexus", 1);
         nexusScriptsLaunched = true;
+        ns.exit();
       }
     }
     
