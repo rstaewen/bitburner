@@ -13,7 +13,7 @@ const MIN_MONEY_AFTER_HACK = 0.05; // Never allow hacks to drive money below 5% 
 const CYCLE_DELAY = 10000;         // 10 seconds between cycles
 const MAX_ACTIVITY_LOG = 8;        // How many recent activities to show
 const DEFAULT_ANALYSIS_CORES = 1;  // Assume single-core scripts for planning estimates
-const RESERVED_SERVERS = ["nexus", "nexus-0"];   // Servers reserved for auxiliary scripts
+const RESERVED_SERVERS = ["nexus"];   // Servers reserved for auxiliary scripts
 const INFO_FILE = '/data/orchestrator-info.json';
 
 // Persistent activity log (survives across cycles)
@@ -142,6 +142,10 @@ async function writeOrchestratorInfo(ns, shareThreads, totalThreads, hackingThre
   };
   
   await ns.write(INFO_FILE, JSON.stringify(info), 'w');
+  const existingReserved = RESERVED_SERVERS.find(s => ns.serverExists(s));
+  if (existingReserved !== null) {
+    ns.scp(INFO_FILE, existingReserved);
+  }
 }
 
 /**
