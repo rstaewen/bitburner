@@ -935,7 +935,9 @@ function getNextPurchaseCost(ns, state) {
 /** @param {NS} ns */
 function getNextGraft(ns, state) {
   const ownedAugs = ns.singularity.getOwnedAugmentations(true);
+  const money = ns.getServerMoneyAvailable('home');
   
+  // First, check priority grafts
   for (const aug of GRAFT_PRIORITY) {
     // Skip if already owned
     if (ownedAugs.includes(aug)) continue;
@@ -958,6 +960,33 @@ function getNextGraft(ns, state) {
       continue;
     }
   }
+  
+  // If all priority grafts done, check opportunistic late-game grafts
+  const opportunisticGrafts = [
+    "QLink",                    // $75t - 75% hack skill
+    "violet Congruity Implant", // $150t - removes graft penalties
+  ];
+  
+  for (const aug of opportunisticGrafts) {
+    if (ownedAugs.includes(aug)) continue;
+    
+    try {
+      const price = ns.grafting.getAugmentationGraftPrice(aug);
+      
+      // Only graft if we can comfortably afford it (have 1.5x the cost)
+      if (money < price * 1.5) continue;
+      
+      const prereqs = ns.singularity.getAugmentationPrereq(aug);
+      const hasPrereqs = prereqs.every(p => ownedAugs.includes(p));
+      
+      if (hasPrereqs) {
+        return aug;
+      }
+    } catch (e) {
+      continue;
+    }
+  }
+  
   return null;
 }
 
