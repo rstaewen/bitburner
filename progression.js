@@ -22,6 +22,7 @@ const CONFIG = {
   CHECK_INTERVAL: 1000,           // Main loop interval (ms)
   CRUISE_CONTROL_TIMEOUT: 60000,  // Idle time before auto-control kicks in (ms)
   METRICS_LOG_INTERVAL: 60000,    // How often to log metrics (ms)
+  MIN_RUN_TIME: 60 * 60 * 1000,   // Minimum time before reset allowed (1 hour)
   
   // Financial thresholds
   FOUR_S_DATA_COST: 1e9,          // $1b
@@ -1595,6 +1596,12 @@ function checkResetConditions(ns, state) {
   // Never reset mid-graft
   if (state.graftInProgress) return false;
   
+  // Never reset before minimum run time (give time to backdoor World Daemon, etc.)
+  const runTime = Date.now() - state.metrics.startTime;
+  if (runTime < CONFIG.MIN_RUN_TIME) {
+    return false;
+  }
+  
   // Build fresh queue to check conditions
   const queue = buildAugQueue(ns, state);
   const queuedCount = queue.augs.length;
@@ -1886,6 +1893,7 @@ function getResetTriggerStatus(ns, state) {
   const queue = state.augQueue || buildAugQueue(ns, state);
   const queuedCount = queue.augs.length;
   const money = ns.getServerMoneyAvailable('home');
+  const runTime = Date.now() - state.metrics.startTime;
   
   // Check if we have The Red Pill (either in queue OR already installed)
   const ownedAugs = ns.singularity.getOwnedAugmentations(true);
@@ -1902,13 +1910,18 @@ function getResetTriggerStatus(ns, state) {
     overrideReason: '',
   };
   
-  // Hard requirements - check both paths
+  // Hard requirements - check all conditions
   const normalHardMet = queuedCount >= CONFIG.MIN_AUGS_FOR_RESET && 
     (queue.allKeyAugsIncluded || queue.missingKeyAugs.length === 0);
+  const minTimeMet = runTime >= CONFIG.MIN_RUN_TIME;
   
   if (state.graftInProgress) {
     result.hardMet = false;
     result.hardReason = 'Graft in progress';
+  } else if (!minTimeMet) {
+    result.hardMet = false;
+    const remaining = CONFIG.MIN_RUN_TIME - runTime;
+    result.hardReason = `Minimum run time not met (${formatTime(remaining)} remaining)`;
   } else if (!normalHardMet && !hasRedPill) {
     result.hardMet = false;
     if (queuedCount < CONFIG.MIN_AUGS_FOR_RESET) {
