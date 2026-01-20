@@ -17,8 +17,6 @@ import {
 
 // === CONFIGURATION ===
 
-const ORCHESTRATOR_INFO_FILE = '/data/orchestrator-info.json';
-
 const CONFIG = {
   // Timing
   CHECK_INTERVAL: 1000,           // Main loop interval (ms)
@@ -142,8 +140,10 @@ const FACTION_REQUIREMENTS = {
   "Illuminati": { type: "special", hacking: 1500, combat: 1200, augs: 30, money: 150e9 },
 };
 
-// Priority order for joining factions (higher = join first)
+// Priority order for joining factions (lower index = higher priority)
 const FACTION_PRIORITY = [
+  // CRITICAL: Daedalus has "The Red Pill" - required to finish BitNode
+  "Daedalus",
   // Hacking factions - always valuable
   "CyberSec", "NiteSec", "The Black Hand", "BitRunners",
   // Key aug factions
@@ -157,7 +157,7 @@ const FACTION_PRIORITY = [
   // Other city factions (lower priority due to enemy conflicts)
   "Chongqing", "New Tokyo", "Ishima", "Volhaven",
   // Special/endgame
-  "Netburners", "The Covenant", "Daedalus", "Illuminati",
+  "Netburners", "The Covenant", "Illuminati",
 ];
 
 // === FACTION MANAGEMENT ===
@@ -821,16 +821,14 @@ function hasMidGameGrafts(state) {
 
 /** @param {NS} ns */
 function isRamSaturated(ns, state) {
-  const info = readOrchestratorInfo(ns);
+  // TODO: Read from shared file written by orchestrator.js
+  // For now, use a placeholder heuristic
+  // Return true if we detect high share thread ratio
   
-  if (info) {
-    // Use actual share ratio from orchestrator
-    return info.shareRatio >= CONFIG.SHARE_THREAD_RATIO_THRESHOLD;
-  }
-  
-  // Fallback: check if we have "enough" RAM
+  // Placeholder: check if we have "enough" RAM
   const servers = ns.getPurchasedServers();
   const totalRam = servers.reduce((sum, s) => sum + ns.getServerMaxRam(s), 0);
+  
   return totalRam >= CONFIG.MIN_RAM_FOR_SATURATION;
 }
 
@@ -1212,6 +1210,9 @@ const AUG_PRICE_MULTIPLIER = 1.9; // Each successive aug costs 1.9x more
 
 // Key augs that should always be included if available
 const KEY_AUGS = [
+  // CRITICAL: The Red Pill is required to finish the BitNode
+  "The Red Pill",
+  // Hacking progression
   "Cranial Signal Processors - Gen I", "Cranial Signal Processors - Gen II",
   "Embedded Netburner Module", "Cranial Signal Processors - Gen III", "CRTX42-AA Gene Modification",
   "The Black Hand", "Cranial Signal Processors - Gen IV",
@@ -1598,16 +1599,30 @@ function checkResetConditions(ns, state) {
   const queue = buildAugQueue(ns, state);
   const queuedCount = queue.augs.length;
   
-  // Hard requirements
-  if (queuedCount < CONFIG.MIN_AUGS_FOR_RESET) return false;
-  if (!queue.allKeyAugsIncluded && queue.missingKeyAugs.length > 0) {
-    // Missing key augs that are available - don't reset yet
+  // Check if we have The Red Pill (either in queue OR already installed)
+  const ownedAugs = ns.singularity.getOwnedAugmentations(true);
+  const hasRedPill = queue.augs.includes("The Red Pill") || ownedAugs.includes("The Red Pill");
+  
+  // Hard requirements - EITHER:
+  // 1. Normal: 10+ augs and all key augs included
+  // 2. Red Pill path: Have The Red Pill (allows NFG-only resets for difficult World Daemon)
+  const normalHardMet = queuedCount >= CONFIG.MIN_AUGS_FOR_RESET && 
+    (queue.allKeyAugsIncluded || queue.missingKeyAugs.length === 0);
+  const redPillHardMet = hasRedPill;
+  
+  if (!normalHardMet && !redPillHardMet) {
     return false;
   }
   
   // Override triggers (reset immediately)
   if (queuedCount >= CONFIG.OVERRIDE_AUGS_FOR_RESET) {
     ns.print(`INFO: Override trigger - ${queuedCount} augs queued`);
+    return true;
+  }
+  
+  // If we have The Red Pill, always allow reset (it's the win condition)
+  if (hasRedPill) {
+    ns.print(`INFO: The Red Pill ${ownedAugs.includes("The Red Pill") ? 'installed' : 'queued'} - resetting for NFG stacks`);
     return true;
   }
   
@@ -1750,6 +1765,36 @@ async function executeReset(ns, state) {
   
   ns.print(`\nPurchased ${purchasedCount}/${queue.augs.length} augs`);
   
+  // Buy home cores with remaining money (before NFG - cores speed up money gain)
+  let coresBought = 0;
+  while (true) {
+    const coreCost = ns.singularity.getUpgradeHomeCoresCost();
+    const money = ns.getServerMoneyAvailable('home');
+    if (coreCost > money || coreCost === Infinity) break;
+    
+    const success = ns.singularity.upgradeHomeCores();
+    if (!success) break;
+    coresBought++;
+  }
+  if (coresBought > 0) {
+    ns.print(`Purchased ${coresBought} home cores`);
+  }
+  
+  // Buy home RAM with remaining money (after cores)
+  let ramUpgrades = 0;
+  while (true) {
+    const ramCost = ns.singularity.getUpgradeHomeRamCost();
+    const money = ns.getServerMoneyAvailable('home');
+    if (ramCost > money || ramCost === Infinity) break;
+    
+    const success = ns.singularity.upgradeHomeRam();
+    if (!success) break;
+    ramUpgrades++;
+  }
+  if (ramUpgrades > 0) {
+    ns.print(`Purchased ${ramUpgrades} home RAM upgrades (now ${ns.getServerMaxRam('home')} GB)`);
+  }
+  
   // Buy NeuroFlux Governor levels with remaining money
   const remainingMoney = ns.getServerMoneyAvailable('home');
   const nfg = calculateNFGLevels(ns, remainingMoney, purchasedCount);
@@ -1771,7 +1816,7 @@ async function executeReset(ns, state) {
   ns.print(`Installing augmentations and resetting...`);
   
   // Install and restart
-  ns.singularity.installAugmentations("progression.js");
+  ns.singularity.installAugmentations("start.js");
 }
 
 // === LOGGING ===
@@ -1842,6 +1887,12 @@ function getResetTriggerStatus(ns, state) {
   const queuedCount = queue.augs.length;
   const money = ns.getServerMoneyAvailable('home');
   
+  // Check if we have The Red Pill (either in queue OR already installed)
+  const ownedAugs = ns.singularity.getOwnedAugmentations(true);
+  const redPillInQueue = queue.augs.includes("The Red Pill");
+  const redPillInstalled = ownedAugs.includes("The Red Pill");
+  const hasRedPill = redPillInQueue || redPillInstalled;
+  
   const result = {
     hardMet: true,
     hardReason: '',
@@ -1851,22 +1902,34 @@ function getResetTriggerStatus(ns, state) {
     overrideReason: '',
   };
   
-  // Hard requirements
+  // Hard requirements - check both paths
+  const normalHardMet = queuedCount >= CONFIG.MIN_AUGS_FOR_RESET && 
+    (queue.allKeyAugsIncluded || queue.missingKeyAugs.length === 0);
+  
   if (state.graftInProgress) {
     result.hardMet = false;
     result.hardReason = 'Graft in progress';
-  } else if (queuedCount < CONFIG.MIN_AUGS_FOR_RESET) {
+  } else if (!normalHardMet && !hasRedPill) {
     result.hardMet = false;
-    result.hardReason = `Only ${queuedCount}/${CONFIG.MIN_AUGS_FOR_RESET} augs queued`;
-  } else if (!queue.allKeyAugsIncluded && queue.missingKeyAugs.length > 0) {
-    result.hardMet = false;
-    result.hardReason = `Missing ${queue.missingKeyAugs.length} key augs`;
+    if (queuedCount < CONFIG.MIN_AUGS_FOR_RESET) {
+      result.hardReason = `Only ${queuedCount}/${CONFIG.MIN_AUGS_FOR_RESET} augs queued`;
+    } else {
+      result.hardReason = `Missing ${queue.missingKeyAugs.length} key augs`;
+    }
   }
   
   // Override check
   if (queuedCount >= CONFIG.OVERRIDE_AUGS_FOR_RESET) {
     result.override = true;
     result.overrideReason = `${queuedCount} augs queued (>= ${CONFIG.OVERRIDE_AUGS_FOR_RESET})`;
+  }
+  
+  // Red Pill override
+  if (hasRedPill) {
+    result.override = true;
+    result.overrideReason = redPillInstalled 
+      ? 'The Red Pill installed - reset for NFG stacks to finish BitNode'
+      : 'The Red Pill queued - install to finish BitNode';
   }
   
   // Soft triggers
