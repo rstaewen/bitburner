@@ -45,8 +45,6 @@ const CONFIG = {
 
 const GRAFT_PRIORITY = [
   // === EARLY GAME (cheap, immediate ROI) ===
-  "Synaptic Enhancement Implant",
-  "Artificial Synaptic Potentiation",
   "Neural Accelerator",
   "Neuralstimulator",
   "PCMatrix",
@@ -780,12 +778,12 @@ function allHackingToolsOwned(state) {
 }
 
 function hasEarlyGrafts(state) {
-  const earlyGrafts = GRAFT_PRIORITY.slice(0, 6); // First 6 are early game
+  const earlyGrafts = GRAFT_PRIORITY.slice(0, 4); // First 6 are early game
   return earlyGrafts.every(aug => state.graftsCompleted.includes(aug));
 }
 
 function hasMidGameGrafts(state) {
-  const midGrafts = GRAFT_PRIORITY.slice(6, 10); // Next 4 are mid game
+  const midGrafts = GRAFT_PRIORITY.slice(4, 8); // Next 4 are mid game
   return midGrafts.every(aug => state.graftsCompleted.includes(aug));
 }
 
