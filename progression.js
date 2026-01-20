@@ -1101,9 +1101,13 @@ async function executeEarlyAcceleration(ns, state, args) {
         if (!args['dry-run']) {
           // Travel to New Tokyo for grafting
           ns.singularity.travelToCity('New Tokyo');
-          ns.grafting.graftAugmentation(nextGraft, false);
-          state.lastActionWasOurs = true; // Mark this as our action
-          ns.print(`INFO: Started grafting ${nextGraft}`);
+          const success = ns.grafting.graftAugmentation(nextGraft, false);
+          if (success) {
+            state.graftInProgress = true; // Set immediately to prevent player action override
+            state.currentGraft = nextGraft;
+            state.lastActionWasOurs = true;
+            ns.print(`INFO: Started grafting ${nextGraft}`);
+          }
         }
       }
     }
@@ -1146,9 +1150,13 @@ async function executeInvestment(ns, state, args) {
       if (money >= cost) {
         if (!args['dry-run']) {
           ns.singularity.travelToCity('New Tokyo');
-          ns.grafting.graftAugmentation(nextGraft, false);
-          state.lastActionWasOurs = true; // Mark this as our action
-          ns.print(`INFO: Started grafting ${nextGraft}`);
+          const success = ns.grafting.graftAugmentation(nextGraft, false);
+          if (success) {
+            state.graftInProgress = true; // Set immediately to prevent player action override
+            state.currentGraft = nextGraft;
+            state.lastActionWasOurs = true;
+            ns.print(`INFO: Started grafting ${nextGraft}`);
+          }
         }
       }
     }
