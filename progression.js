@@ -259,19 +259,12 @@ function handleFactionInvitations(ns, state, args) {
       continue;
     }
     
-    // Second check: would joining conflict with already joined factions?
+    // Second check: have we already joined an enemy faction?
+    // This handles both "already committed to alliance" and "would conflict"
+    // If we haven't joined any faction in an alliance yet, the first one by priority wins
     if (wouldConflictWithJoined(faction, joinedFactions)) {
       if (args.debug) {
         ns.print(`DEBUG: Skipping ${faction} - conflicts with joined faction`);
-      }
-      continue;
-    }
-    
-    // Third check: would joining block a faction we still need augs from?
-    const blockedFaction = wouldBlockNeededFaction(ns, faction, joinedFactions);
-    if (blockedFaction) {
-      if (args.debug) {
-        ns.print(`DEBUG: Skipping ${faction} - would block ${blockedFaction} which has needed augs`);
       }
       continue;
     }
@@ -309,30 +302,6 @@ function wouldConflictWithJoined(faction, joinedFactions) {
   if (!enemies) return false;
   
   return enemies.some(enemy => joinedFactions.includes(enemy));
-}
-
-/**
- * Check if joining a faction would block an enemy faction we still need augs from
- * @param {NS} ns
- * @param {string} faction
- * @param {string[]} joinedFactions
- * @returns {string|null} - Name of blocked faction, or null if none
- */
-function wouldBlockNeededFaction(ns, faction, joinedFactions) {
-  const enemies = FACTION_ENEMIES[faction];
-  if (!enemies) return null;
-  
-  for (const enemy of enemies) {
-    // Skip if already joined
-    if (joinedFactions.includes(enemy)) continue;
-    
-    // Check if we need augs from this enemy faction
-    if (needAugsFromFaction(ns, enemy)) {
-      return enemy;
-    }
-  }
-  
-  return null;
 }
 
 /**
