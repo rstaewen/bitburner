@@ -327,7 +327,13 @@ export function executePlayerAssignment(ns, assignment) {
   switch (assignment.type) {
     case 'faction':
       // Player should do hacking contracts for maximum rep gain
-      ns.singularity.workForFaction(assignment.target, 'hacking', false);
+      const workTypes = ns.singularity.getFactionWorkTypes(assignment.target);
+      let workType = 'hacking'
+      if (!workTypes.includes('hacking')) {
+        workType = workTypes[0];
+      }
+      ns.tprint("ASSIGNING: ", assignment.target, workType);
+      ns.singularity.workForFaction(assignment.target, workType, false);
       break;
     case 'company':
       ns.singularity.workForCompany(assignment.target, false);
