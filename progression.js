@@ -1202,6 +1202,7 @@ const KEY_AUGS = [
 /**
  * Build the optimal aug purchase queue
  * Respects prerequisites while maximizing expensive-first ordering
+ * Prioritizes KEY_AUGS and their prerequisites
  * @param {NS} ns
  * @param {Object} state
  * @returns {{augs: string[], totalCost: number, affordable: boolean}}
@@ -1213,43 +1214,87 @@ function buildAugQueue(ns, state) {
   const totalMoney = cash + stockValue;
   
   const ownedAugs = ns.singularity.getOwnedAugmentations(true);
+  const ownedSet = new Set(ownedAugs);
   
   // Get all available augs from joined factions (with prereq info)
   const availableAugs = getAvailableAugsWithPrereqs(ns, ownedAugs);
   
-  // Sort by price descending (most expensive first) as a starting point
-  availableAugs.sort((a, b) => b.price - a.price);
+  // Build a map for quick lookup
+  const augMap = new Map(availableAugs.map(a => [a.name, a]));
   
-  // Build queue respecting prerequisites
-  // We'll greedily add augs, but ensure prereqs come before dependents
+  // Find all key augs and their prereqs (recursively)
+  const keyAugSet = new Set();
+  function addWithPrereqs(augName) {
+    if (keyAugSet.has(augName)) return;
+    if (ownedSet.has(augName)) return;
+    if (!augMap.has(augName)) return;
+    
+    const aug = augMap.get(augName);
+    // Add prereqs first
+    for (const prereq of aug.prereqs) {
+      addWithPrereqs(prereq);
+    }
+    keyAugSet.add(augName);
+  }
+  
+  for (const keyAug of KEY_AUGS) {
+    if (augMap.has(keyAug)) {
+      addWithPrereqs(keyAug);
+    }
+  }
+  
+  // Separate into key augs (with prereqs) and others
+  const keyAugsWithPrereqs = availableAugs.filter(a => keyAugSet.has(a.name));
+  const otherAugs = availableAugs.filter(a => !keyAugSet.has(a.name));
+  
+  // Sort both groups by price descending
+  keyAugsWithPrereqs.sort((a, b) => b.price - a.price);
+  otherAugs.sort((a, b) => b.price - a.price);
+  
+  // Build queue: key augs first (respecting prereqs), then others
   const queue = [];
   const queueSet = new Set();
-  const ownedSet = new Set(ownedAugs);
   let totalCost = 0;
   
-  // Keep trying to add augs until we can't add any more
+  // Helper to try adding an aug
+  function tryAddAug(aug) {
+    if (queueSet.has(aug.name)) return false;
+    
+    // Check prereqs satisfied
+    const prereqsSatisfied = aug.prereqs.every(p => ownedSet.has(p) || queueSet.has(p));
+    if (!prereqsSatisfied) return false;
+    
+    // Check affordability
+    const queuePosition = queue.length;
+    const multipliedPrice = aug.price * Math.pow(AUG_PRICE_MULTIPLIER, queuePosition);
+    const newTotal = totalCost + multipliedPrice;
+    
+    if (newTotal <= totalMoney) {
+      queue.push(aug.name);
+      queueSet.add(aug.name);
+      totalCost = newTotal;
+      return true;
+    }
+    return false;
+  }
+  
+  // First pass: add key augs and their prereqs
   let madeProgress = true;
   while (madeProgress) {
     madeProgress = false;
-    
-    for (const aug of availableAugs) {
-      // Skip if already in queue
-      if (queueSet.has(aug.name)) continue;
-      
-      // Check if all prereqs are satisfied (owned or in queue)
-      const prereqsSatisfied = aug.prereqs.every(p => ownedSet.has(p) || queueSet.has(p));
-      if (!prereqsSatisfied) continue;
-      
-      // Calculate cost at current queue position
-      const queuePosition = queue.length;
-      const multipliedPrice = aug.price * Math.pow(AUG_PRICE_MULTIPLIER, queuePosition);
-      const newTotal = totalCost + multipliedPrice;
-      
-      // Check if we can afford it
-      if (newTotal <= totalMoney) {
-        queue.push(aug.name);
-        queueSet.add(aug.name);
-        totalCost = newTotal;
+    for (const aug of keyAugsWithPrereqs) {
+      if (tryAddAug(aug)) {
+        madeProgress = true;
+      }
+    }
+  }
+  
+  // Second pass: add other augs
+  madeProgress = true;
+  while (madeProgress) {
+    madeProgress = false;
+    for (const aug of otherAugs) {
+      if (tryAddAug(aug)) {
         madeProgress = true;
       }
     }
@@ -1284,6 +1329,7 @@ function buildAugQueue(ns, state) {
 
 /**
  * Get all augs available for purchase, including prerequisite info
+ * Also ensures prereqs are included if we have rep for them anywhere
  * @param {NS} ns
  * @param {string[]} ownedAugs
  * @returns {{name: string, price: number, rep: number, faction: string, prereqs: string[]}[]}
@@ -1291,10 +1337,12 @@ function buildAugQueue(ns, state) {
 function getAvailableAugsWithPrereqs(ns, ownedAugs) {
   const available = [];
   const seen = new Set(ownedAugs);
+  const ownedSet = new Set(ownedAugs);
   
   const allFactions = Object.values(ns.enums.FactionName);
   const joinedFactions = allFactions.filter(f => ns.singularity.getFactionRep(f) > 0);
   
+  // First pass: collect all augs we have rep for
   for (const faction of joinedFactions) {
     const factionRep = ns.singularity.getFactionRep(faction);
     const factionAugs = ns.singularity.getAugmentationsFromFaction(faction);
@@ -1318,6 +1366,46 @@ function getAvailableAugsWithPrereqs(ns, ownedAugs) {
       });
       
       seen.add(augName);
+    }
+  }
+  
+  // Second pass: ensure all prereqs of available augs are also available
+  // (they might be purchasable from a different faction)
+  const toCheck = [...available];
+  while (toCheck.length > 0) {
+    const aug = toCheck.pop();
+    
+    for (const prereqName of aug.prereqs) {
+      // Skip if already owned or already in available list
+      if (ownedSet.has(prereqName)) continue;
+      if (seen.has(prereqName)) continue;
+      
+      // Find a faction that can sell us this prereq
+      for (const faction of joinedFactions) {
+        const factionRep = ns.singularity.getFactionRep(faction);
+        const factionAugs = ns.singularity.getAugmentationsFromFaction(faction);
+        
+        if (!factionAugs.includes(prereqName)) continue;
+        
+        const repReq = ns.singularity.getAugmentationRepReq(prereqName);
+        if (factionRep < repReq) continue;
+        
+        const price = ns.singularity.getAugmentationPrice(prereqName);
+        const prereqs = ns.singularity.getAugmentationPrereq(prereqName);
+        
+        const prereqAug = {
+          name: prereqName,
+          price: price,
+          rep: repReq,
+          faction: faction,
+          prereqs: prereqs,
+        };
+        
+        available.push(prereqAug);
+        seen.add(prereqName);
+        toCheck.push(prereqAug); // Check this prereq's prereqs too
+        break; // Found a faction, no need to check others
+      }
     }
   }
   
