@@ -53,8 +53,6 @@ const GRAFT_PRIORITY = [
   // === MID GAME ===
   "Social Negotiation Assistant (S.N.A)",
   "BitRunners Neurolink",
-  "Embedded Netburner Module Analyze Engine",
-  "Embedded Netburner Module Direct Memory Access Upgrade",
   "Xanipher",
   "ECorp HVMind Implant",
   
@@ -1058,7 +1056,7 @@ async function executeEarlyAcceleration(ns, state, args) {
   
   if (!state.graftInProgress) {
     const nextGraft = getNextGraft(ns, state);
-    const earlyGrafts = GRAFT_PRIORITY.slice(0, 6);
+    const earlyGrafts = GRAFT_PRIORITY.slice(0, 4);
     
     if (nextGraft && earlyGrafts.includes(nextGraft)) {
       const cost = ns.grafting.getAugmentationGraftPrice(nextGraft);
