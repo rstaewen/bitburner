@@ -776,7 +776,7 @@ function allHackingToolsOwned(state) {
 }
 
 function hasEarlyGrafts(state) {
-  const earlyGrafts = GRAFT_PRIORITY.slice(0, 4); // First 6 are early game
+  const earlyGrafts = GRAFT_PRIORITY.slice(0, 4); // First 4 are early game
   return earlyGrafts.every(aug => state.graftsCompleted.includes(aug));
 }
 
@@ -1716,6 +1716,11 @@ function checkResetConditions(ns, state) {
     softTriggers++;
   }
   
+  // Been running for 24+ hours - time to reset and boost stats
+  if (runTime >= 24 * 60 * 60 * 1000) {
+    softTriggers++;
+  }
+  
   return softTriggers >= 2;
 }
 
@@ -2018,6 +2023,10 @@ function getResetTriggerStatus(ns, state) {
   const companiesOptimal = checkCompaniesAtThresholds(ns);
   result.soft['All companies at thresholds'] = companiesOptimal;
   if (companiesOptimal) result.softCount++;
+  
+  const longRun = runTime >= 24 * 60 * 60 * 1000;
+  result.soft['24+ hours since install'] = longRun;
+  if (longRun) result.softCount++;
   
   return result;
 }
