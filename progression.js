@@ -17,6 +17,8 @@ import {
 
 // === CONFIGURATION ===
 
+const ORCHESTRATOR_INFO_FILE = "data/orchestrator-info.json";
+
 const CONFIG = {
   // Timing
   CHECK_INTERVAL: 1000,           // Main loop interval (ms)
@@ -200,7 +202,7 @@ function createInitialState(ns) {
     
     // Metrics tracking
     metrics: {
-      startTime: Date.now(),
+      startTime: ns.getResetInfo().lastAugReset,
       phaseStartTime: Date.now(),
       moneyOverTime: [],             // [{time, money}, ...]
       incomeRate: 0,                 // $/sec calculated from recent data
@@ -787,9 +789,11 @@ function hasMidGameGrafts(state) {
 
 /** @param {NS} ns */
 function isRamSaturated(ns, state) {
-  // TODO: Read from shared file written by orchestrator.js
-  // For now, use a placeholder heuristic
-  // Return true if we detect high share thread ratio
+  const orchestratorInfo = readOrchestratorInfo(ns);
+  if (orchestratorInfo !== null) {
+    //ns.print("orchestrator info: ", orchestratorInfo);
+    return orchestratorInfo.saturated && orchestratorInfo.shareThreads > orchestratorInfo.totalThreads * 0.3;
+  }
   
   // Placeholder: check if we have "enough" RAM
   const servers = ns.getPurchasedServers();

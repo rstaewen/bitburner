@@ -42,6 +42,46 @@ function getTopTargets(ns) {
 /**
  * Estimate the theoretical best-case earning rate for a server, assuming
  * a full grow-to-max cycle followed by a hack down to 5% remaining cash.
+ * Naively assumes we can apply weakens instantly by stacking (we cannot)
+ * Cycle length ≈ growTime(min sec) + hackTime(min sec).
+ * @param {NS} ns
+ * @param {string} server
+ * @param {Player} player
+ * @param {NS["formulas"] | null} formulas
+ * @returns {number} dollars per second
+a */
+function computeConservativeRate(ns, server, player, formulas) {
+  const maxMoney = ns.getServerMaxMoney(server);
+  if (maxMoney <= 0) return 0;
+
+  const cycleMoney = maxMoney * (1 - MIN_REMAINING_FRACTION);
+  let hackTime;
+  let growTime;
+  let weakenTime;
+
+  if (formulas && formulas.hacking) {
+    const snapshot = ns.getServer(server);
+    snapshot.hackDifficulty = snapshot.minDifficulty;
+    snapshot.moneyAvailable = maxMoney;
+    hackTime = formulas.hacking.hackTime(snapshot, player);
+    growTime = formulas.hacking.growTime(snapshot, player);
+    weakenTime = formulas.hacking.weakenTime(snapshot, player);
+  } else {
+    hackTime = ns.getHackTime(server);
+    growTime = ns.getGrowTime(server);
+    weakenTime = ns.getWeakenTime(server);
+  }
+
+  const cycleMs = hackTime + growTime + 2 * weakenTime;
+  if (cycleMs <= 0) return 0;
+
+  return cycleMoney / (cycleMs / 1000);
+}
+
+/**
+ * Estimate the theoretical best-case earning rate for a server, assuming
+ * a full grow-to-max cycle followed by a hack down to 5% remaining cash.
+ * Naively assumes we can apply weakens instantly by stacking (we cannot)
  * Cycle length ≈ growTime(min sec) + hackTime(min sec).
  * @param {NS} ns
  * @param {string} server
@@ -56,6 +96,7 @@ function computeTheoreticalRate(ns, server, player, formulas) {
   const cycleMoney = maxMoney * (1 - MIN_REMAINING_FRACTION);
   let hackTime;
   let growTime;
+  let weakenTime;
 
   if (formulas && formulas.hacking) {
     const snapshot = ns.getServer(server);
@@ -63,6 +104,7 @@ function computeTheoreticalRate(ns, server, player, formulas) {
     snapshot.moneyAvailable = maxMoney;
     hackTime = formulas.hacking.hackTime(snapshot, player);
     growTime = formulas.hacking.growTime(snapshot, player);
+    weakenTime = formulas.hacking.weakenTime(snapshot, player);
   } else {
     hackTime = ns.getHackTime(server);
     growTime = ns.getGrowTime(server);
@@ -204,6 +246,7 @@ export async function main(ns) {
 
     let totalActual = 0;
     let totalTheoreticalPerSec = 0;
+    let totalConservativePerSec = 0;
     const now = Date.now();
 
     for (const { server } of topTargets) {
@@ -212,7 +255,8 @@ export async function main(ns) {
         prevMoney: currentMoney,
         actualEarned: 0,
         lastDelta: 0,
-        theoreticalPerSec: 0
+        theoreticalPerSec: 0,
+        conservativePerSec: 0
       };
 
       let delta = record.prevMoney - currentMoney;
@@ -221,6 +265,7 @@ export async function main(ns) {
       record.lastDelta = delta;
       record.prevMoney = currentMoney;
       record.theoreticalPerSec = computeTheoreticalRate(ns, server, player, formulas);
+      record.conservativePerSec = computeConservativeRate(ns, server, player, formulas);
       record.lastMax = ns.getServerMaxMoney(server);
       record.lastUpdate = now;
 
@@ -228,6 +273,7 @@ export async function main(ns) {
 
       totalActual += record.actualEarned;
       totalTheoreticalPerSec += record.theoreticalPerSec;
+      totalConservativePerSec += record.conservativePerSec;
     }
 
     const elapsedSec = Math.max(1, (now - startTime) / 1000);
@@ -249,10 +295,12 @@ export async function main(ns) {
         const record = stats.get(server);
         const actualPerSec = record.actualEarned / elapsedSec;
         const theoreticalPerSec = record.theoreticalPerSec;
-        const efficiency = theoreticalPerSec > 0 ? (actualPerSec / theoreticalPerSec) * 100 : 0;
+        const conservativePerSec = record.conservativePerSec;
+        const theoreticalEfficiency = theoreticalPerSec > 0 ? (actualPerSec / theoreticalPerSec) * 100 : 0;
+        const conservativeEfficency = conservativePerSec > 0 ? (actualPerSec / conservativePerSec) * 100 : 0;
         const recentPerSec = record.lastDelta / (SAMPLE_INTERVAL / 1000);
 
-        const line = `${server.padEnd(12)} | $${format(ns, record.actualEarned)} | $${format(ns, actualPerSec)} | $${format(ns, theoreticalPerSec)} | ${efficiency.toFixed(1).padStart(5)} | $${format(ns, recentPerSec)} | $${ns.formatNumber(record.lastMax, 1)}`;
+        const line = `${server.padEnd(12)} | $${format(ns, record.actualEarned)} | $${format(ns, actualPerSec)} | $${format(ns, theoreticalPerSec)} |  ${theoreticalEfficiency.toFixed(1).padStart(5)} |  ${conservativeEfficency.toFixed(1).padStart(5)} | $${format(ns, recentPerSec)} | $${ns.formatNumber(record.lastMax, 1)}`;
         ns.print(line);
       }
     }
@@ -262,6 +310,8 @@ export async function main(ns) {
     ns.print(`Aggregate theoretical max: $${ns.formatNumber(totalTheoreticalPerSec)}/s`);
     const aggregateEfficiency = totalTheoreticalPerSec > 0 ? (totalActualPerSec / totalTheoreticalPerSec) * 100 : 0;
     ns.print(`Efficiency vs theoretical: ${aggregateEfficiency.toFixed(1)}%`);
+    const aggregateConservativeEfficiency = totalConservativePerSec > 0 ? (totalActualPerSec / totalConservativePerSec) * 100 : 0;
+    ns.print(`Efficiency vs conservative: ${aggregateConservativeEfficiency.toFixed(1)}%`);
 
     const tradingSummary = updateInvestmentTracker(ns, tradingTracker, totalActual);
     if (tradingSummary) {

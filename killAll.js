@@ -8,13 +8,17 @@ export async function main(ns) {
   const serversToClean = ns.scan("home");
   const visited = new Set(["home"]);
   const queue = [...serversToClean];
+  const data = ns.flags([
+    ['x', 'home'], // a default number means this flag is a number
+  ]);
+  const serverException = data['x']
 
   // Always kill scripts on home first to free up local RAM
   ns.killall("home", true);
 
   while (queue.length > 0) {
     const server = queue.shift();
-    if (visited.has(server)) continue;
+    if (visited.has(server) || server === serverException) continue;
     visited.add(server);
 
     ns.killall(server, true);

@@ -159,10 +159,6 @@ function findBestAction(ns) {
     if (nextRam > maxRam) continue;
     
     const upgradeCost = ns.getPurchasedServerUpgradeCost(server, nextRam);
-    if (upgradeCost > getMaxServerCost(ns)) {
-      ns.ui.closeTail();
-      ns.exit();
-    }
     if (upgradeCost <= money && upgradeCost > 0) {
       const ramGain = nextRam - currentRam;
       const costPerRam = upgradeCost / ramGain;
@@ -360,6 +356,13 @@ export async function main(ns) {
         ns.print(`  run sleeve-manager.js --tail`);
         ns.print("");
         ns.killall("nexus", true);
+        await ns.sleep(1000);
+        ns.print("1");
+        await ns.sleep(1000);
+        ns.print("2");
+        await ns.sleep(1000);
+        ns.print("3");
+        await ns.sleep(1000);
         ns.exec("nexus.js", "nexus", 1);
         nexusScriptsLaunched = true;
       }
