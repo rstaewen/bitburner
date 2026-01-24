@@ -174,6 +174,7 @@ function createInitialState(ns) {
     graftInProgress: false,
     currentGraft: null,
     graftsCompleted: [],
+    graftFailures: 0,  // Track consecutive failures to prevent infinite loops
     
     // Faction unlock progress
     needKills: 0,
@@ -638,6 +639,7 @@ async function updateGameState(ns, state) {
   state.graftInProgress = currentWork?.type === 'GRAFTING';
   if (state.graftInProgress) {
     state.currentGraft = currentWork.augmentation;
+    state.graftFailures = 0; // Reset failure counter when grafting is in progress
   }
   
   const ownedAugs = ns.singularity.getOwnedAugmentations(true);
@@ -769,6 +771,14 @@ function hasMidGameGrafts(state) {
 
 async function manageFinances(ns, state, args) {
   const money = ns.getServerMoneyAvailable('home');
+  
+  // Don't liquidate if we've had too many graft failures (prevents infinite loop)
+  if (state.graftFailures >= 3) {
+    if (args.debug) {
+      ns.print(`DEBUG: Skipping liquidation check - too many graft failures (${state.graftFailures})`);
+    }
+    return;
+  }
   
   const upcomingCost = getNextPurchaseCost(ns, state);
   const shortfall = upcomingCost - money;
@@ -974,28 +984,82 @@ async function executeBootstrap(ns, state, args) {
   }
 }
 
-async function executeEarlyAcceleration(ns, state, args) {
-  if (!state.graftInProgress) {
-    const nextGraft = getNextGraft(ns, state);
-    const earlyGrafts = GRAFT_PRIORITY.slice(0, 4);
-    
-    if (nextGraft && earlyGrafts.includes(nextGraft)) {
-      const cost = ns.grafting.getAugmentationGraftPrice(nextGraft);
-      const money = ns.getServerMoneyAvailable('home');
-      
-      if (money >= cost) {
-        if (!args['dry-run']) {
-          ns.singularity.travelToCity('New Tokyo');
-          const success = ns.grafting.graftAugmentation(nextGraft, false);
-          if (success) {
-            state.graftInProgress = true;
-            state.currentGraft = nextGraft;
-            state.lastActionWasOurs = true;
-            ns.print(`INFO: Started grafting ${nextGraft}`);
-          }
-        }
-      }
+/**
+ * Helper function to attempt grafting with proper work stoppage and error handling
+ * @returns {boolean} Whether grafting was successfully started
+ */
+function attemptGraft(ns, state, args, graftName) {
+  const cost = ns.grafting.getAugmentationGraftPrice(graftName);
+  const money = ns.getServerMoneyAvailable('home');
+  
+  if (money < cost) {
+    if (args.debug) {
+      ns.print(`DEBUG: Want to graft ${graftName} but need $${ns.formatNumber(cost)}, have $${ns.formatNumber(money)}`);
     }
+    return false;
+  }
+  
+  if (args['dry-run']) {
+    ns.print(`DRY-RUN: Would graft ${graftName}`);
+    return true;
+  }
+  
+  // Stop any current work before grafting
+  const currentWork = ns.singularity.getCurrentWork();
+  if (currentWork) {
+    ns.singularity.stopAction();
+    ns.print(`INFO: Stopped ${currentWork.type} work to begin grafting`);
+  }
+  
+  // Travel to New Tokyo (required for grafting)
+  const player = ns.getPlayer();
+  if (player.city !== 'New Tokyo') {
+    const travelSuccess = ns.singularity.travelToCity('New Tokyo');
+    if (!travelSuccess) {
+      ns.print(`WARN: Failed to travel to New Tokyo for grafting`);
+      state.graftFailures++;
+      state.lastLiquidation = Date.now(); // Prevent immediate stock repurchase
+      return false;
+    }
+  }
+  
+  // Attempt the graft
+  const success = ns.grafting.graftAugmentation(graftName, false);
+  
+  if (success) {
+    state.graftInProgress = true;
+    state.currentGraft = graftName;
+    state.lastActionWasOurs = true;
+    state.graftFailures = 0; // Reset failure counter on success
+    ns.print(`INFO: Started grafting ${graftName}`);
+    return true;
+  } else {
+    // Log failure with diagnostic info
+    state.graftFailures++;
+    state.lastLiquidation = Date.now(); // Prevent stock trader restart to avoid buy/sell loop
+    
+    const newWork = ns.singularity.getCurrentWork();
+    const workStatus = newWork ? `currently doing ${newWork.type}` : 'not working';
+    
+    ns.print(`WARN: Failed to start grafting ${graftName} (${workStatus}, failures: ${state.graftFailures})`);
+    
+    if (state.graftFailures >= 3) {
+      ns.print(`ERROR: ${state.graftFailures} consecutive graft failures - pausing graft attempts`);
+    }
+    
+    return false;
+  }
+}
+
+async function executeEarlyAcceleration(ns, state, args) {
+  if (state.graftInProgress) return;
+  if (state.graftFailures >= 3) return; // Don't attempt if we've failed too many times
+  
+  const nextGraft = getNextGraft(ns, state);
+  const earlyGrafts = GRAFT_PRIORITY.slice(0, 4);
+  
+  if (nextGraft && earlyGrafts.includes(nextGraft)) {
+    attemptGraft(ns, state, args, nextGraft);
   }
 }
 
@@ -1018,26 +1082,13 @@ async function executePassiveIncome(ns, state, args) {
 }
 
 async function executeInvestment(ns, state, args) {
-  if (!state.graftInProgress) {
-    const nextGraft = getNextGraft(ns, state);
-    
-    if (nextGraft) {
-      const cost = ns.grafting.getAugmentationGraftPrice(nextGraft);
-      const money = ns.getServerMoneyAvailable('home');
-      
-      if (money >= cost) {
-        if (!args['dry-run']) {
-          ns.singularity.travelToCity('New Tokyo');
-          const success = ns.grafting.graftAugmentation(nextGraft, false);
-          if (success) {
-            state.graftInProgress = true;
-            state.currentGraft = nextGraft;
-            state.lastActionWasOurs = true;
-            ns.print(`INFO: Started grafting ${nextGraft}`);
-          }
-        }
-      }
-    }
+  if (state.graftInProgress) return;
+  if (state.graftFailures >= 3) return; // Don't attempt if we've failed too many times
+  
+  const nextGraft = getNextGraft(ns, state);
+  
+  if (nextGraft) {
+    attemptGraft(ns, state, args, nextGraft);
   }
 }
 
@@ -1601,6 +1652,10 @@ function getNextUnaffordableAugCost(ns, state, queue) {
   return queue.totalCost + nextAugMultipliedCost;
 }
 
+/**
+ * Reset by installing augmentations
+ * @param {NS} ns
+ */
 async function executeReset(ns, state) {
   ns.print(`\n=== EXECUTING RESET ===`);
   
@@ -1690,8 +1745,32 @@ async function executeReset(ns, state) {
     ns.print(logs[i]);
   }
 
-  ns.write(LOG_FILE, JSON.stringify(logs), 'a');
-  ns.scp(LOG_FILE, "home", ns.getServer().hostname);
+  //get aggregate log file
+  let gotFile = ns.scp(LOG_FILE, ns.getServer().hostname, "home");
+  if (gotFile) {
+    //append logs to aggregate log file
+    ns.write(LOG_FILE, `==== BITNODE ${ns.getResetInfo().currentNode} RESET LOG ${Date.now()} ====\n`, 'a');
+    ns.write(LOG_FILE, JSON.stringify(logs, null, 2) + '\n', 'a');
+    ns.print("added to log file");
+  } else {
+    //write new log file
+    ns.write(LOG_FILE, `==== BITNODE ${ns.getResetInfo().currentNode} RESET LOG ${Date.now()} ====\n`, 'w');
+    ns.write(LOG_FILE, JSON.stringify(logs, null, 2) + '\n', 'w');
+    ns.print("wrote new log file");
+  }
+  //copy back to home
+  let sentFile = ns.scp(LOG_FILE, "home");
+  if (!sentFile) {
+    ns.print("Failed to send log file back to home! It'll probably be lost.");
+  }
+
+  await ns.sleep(1000);
+  ns.print(`\n=== RESETTING NOW... 3 ===\n`);
+  await ns.sleep(1000);
+  ns.print(`\n=== RESETTING NOW... 2 ===\n`);
+  await ns.sleep(1000);
+  ns.print(`\n=== RESETTING NOW... 1 ===\n`);
+  await ns.sleep(1000);
   
   ns.singularity.installAugmentations("start.js");
 }
@@ -1711,6 +1790,9 @@ function logMetrics(ns, state) {
   ns.print(`Hacking: ${state.metrics.hackingLevel}`);
   ns.print(`Grafts completed: ${state.graftsCompleted.length}`);
   ns.print(`Grafting: ${state.graftInProgress ? state.currentGraft : 'no'}`);
+  if (state.graftFailures > 0) {
+    ns.print(`Graft failures: ${state.graftFailures}`);
+  }
   ns.print(`Stock trader: ${state.stockTraderRunning ? 'running' : 'stopped'}`);
   ns.print(`4S Data: ${state.has4SData} | 4S TIX: ${state.has4STIX}`);
   
@@ -1872,7 +1954,8 @@ function getResetTriggerStatus(ns, state) {
 function logDebugStatus(ns, state) {
   const job = state.currentPriorityJob;
   const jobStr = job ? `${job.type}:${job.name}` : 'none';
-  ns.print(`[${state.phase}] Mode:${state.mode} | Job:${jobStr} | $${ns.formatNumber(ns.getServerMoneyAvailable('home'))}`);
+  const graftStatus = state.graftFailures > 0 ? ` | GraftFail:${state.graftFailures}` : '';
+  ns.print(`[${state.phase}] Mode:${state.mode} | Job:${jobStr} | $${ns.formatNumber(ns.getServerMoneyAvailable('home'))}${graftStatus}`);
 }
 
 // === UTILITIES ===

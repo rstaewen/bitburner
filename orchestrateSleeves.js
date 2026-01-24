@@ -17,7 +17,7 @@ import {
 
 const CONFIG = {
   CHECK_INTERVAL: 1000,
-  STAT_FLOOR: 20000, // Average exp threshold for training
+  STAT_FLOOR: 10000, // Average exp threshold for training
   DEPRIORITIZE_DONATABLE_FACTIONS: true, // Match progression.js setting
 };
 
@@ -46,48 +46,36 @@ export async function main(ns) {
     try {
       const numSleeves = ns.sleeve.getNumSleeves();
       
-      // Track which factions/companies are already being worked by sleeves
-      // Sleeves can work the same job as each other AND the player
+      // Get full priority list ONCE (no exclusions) to check validity of current jobs
+      const dummyStats = getSleeveStats(ns, 0);
+      const allPriorityJobs = getPriorityJobs(ns, dummyStats, true, new Set(), { 
+        deprioritizeDonatable: CONFIG.DEPRIORITIZE_DONATABLE_FACTIONS 
+      });
+      const validJobNames = new Set(allPriorityJobs.map(j => j.name));
+      
+      // Track which jobs are being worked by sleeves that should continue
       const usedJobs = new Set();
       
-      // First pass: record jobs already in use by sleeves that don't need reassignment
+      // First pass: determine which sleeves should keep their current job
+      const sleeveNeedsReassignment = [];
+      
       for (let i = 0; i < numSleeves; i++) {
         const task = ns.sleeve.getTask(i);
         const desiredJob = getDesiredJob(ns, i);
+        const currentJobName = task?.factionName || task?.companyName || null;
         
-        // If sleeve is doing REP work and should continue, mark the job as used
-        if (desiredJob === Jobs.REP && task) {
-          if (task.type === "FACTION" && task.factionName) {
-            // Check if this sleeve should continue this work
-            const stats = getSleeveStats(ns, i);
-            const jobs = getPriorityJobs(ns, stats, true, usedJobs, { 
-              deprioritizeDonatable: CONFIG.DEPRIORITIZE_DONATABLE_FACTIONS 
-            });
-            
-            // If current work matches a priority job, keep doing it
-            const currentJobMatch = jobs.find(j => 
-              j.type === "faction" && j.name === task.factionName
-            );
-            if (currentJobMatch) {
-              usedJobs.add(task.factionName);
-            }
-          } else if (task.type === "COMPANY" && task.companyName) {
-            const stats = getSleeveStats(ns, i);
-            const jobs = getPriorityJobs(ns, stats, true, usedJobs, { 
-              deprioritizeDonatable: CONFIG.DEPRIORITIZE_DONATABLE_FACTIONS 
-            });
-            
-            const currentJobMatch = jobs.find(j => 
-              j.type === "company" && j.name === task.companyName
-            );
-            if (currentJobMatch) {
-              usedJobs.add(task.companyName);
-            }
-          }
+        let needsReassignment = true;
+        
+        if (desiredJob === Jobs.REP && currentJobName && validJobNames.has(currentJobName)) {
+          // Current job is still a valid priority - keep it
+          usedJobs.add(currentJobName);
+          needsReassignment = false;
         }
+        
+        sleeveNeedsReassignment.push(needsReassignment);
       }
       
-      // Second pass: assign jobs
+      // Second pass: assign jobs to sleeves that need them
       for (let i = 0; i < numSleeves; i++) {
         const task = ns.sleeve.getTask(i);
         const desiredJob = getDesiredJob(ns, i);
@@ -100,7 +88,13 @@ export async function main(ns) {
         } else if (desiredJob === Jobs.TRAIN) {
           needsAction = !ns.isRunning("utils/trainSleeve.js", "nexus", i);
         } else if (desiredJob === Jobs.REP) {
-          needsAction = shouldReassignSleeve(ns, i, task, usedJobs);
+          // Use the pre-computed reassignment flag
+          needsAction = sleeveNeedsReassignment[i];
+          
+          // Also check if not doing faction/company work at all
+          if (!task || (task.type !== "FACTION" && task.type !== "COMPANY")) {
+            needsAction = true;
+          }
         } else if (desiredJob === Jobs.CRIME) {
           needsAction = task?.type !== "CRIME";
         }
@@ -177,71 +171,16 @@ function killSleeveScripts(ns, sleeveNumber) {
 function getDesiredJob(ns, sleeveNumber) {
   const sleeve = ns.sleeve.getSleeve(sleeveNumber);
   const purchasableAugs = ns.sleeve.getSleevePurchasableAugs(sleeveNumber);
-  const avgExp = (sleeve.exp.agility + sleeve.exp.charisma + sleeve.exp.defense + sleeve.exp.dexterity + sleeve.exp.strength) / 5;
+  const avgExp = (sleeve.exp.agility + sleeve.exp.defense + sleeve.exp.dexterity + sleeve.exp.strength) / 4;
+  const playerAvgExp = (ns.getPlayer().exp.agility + ns.getPlayer().exp.defense + ns.getPlayer().exp.dexterity + ns.getPlayer().exp.strength) / 4;
   
   if (purchasableAugs.length > 0 && sleeve.shock === 0) {
     return Jobs.AUG;
-  } else if (avgExp < CONFIG.STAT_FLOOR) {
+  } else if (avgExp < CONFIG.STAT_FLOOR || playerAvgExp < CONFIG.STAT_FLOOR) {
     return Jobs.TRAIN;
   } else {
     return Jobs.REP;
   }
-}
-
-/**
- * Check if a sleeve should be reassigned to a different job
- * @param {NS} ns
- * @param {number} sleeveNumber
- * @param {Object} currentTask - Current sleeve task
- * @param {Set} usedJobs - Jobs already taken by other sleeves
- * @returns {boolean}
- */
-function shouldReassignSleeve(ns, sleeveNumber, currentTask, usedJobs) {
-  // If not doing faction or company work, needs reassignment
-  if (!currentTask) return true;
-  if (currentTask.type !== "FACTION" && currentTask.type !== "COMPANY") return true;
-  
-  const currentJobName = currentTask.factionName || currentTask.companyName;
-  if (!currentJobName) return true;
-  
-  // Get priority jobs for this sleeve
-  const stats = getSleeveStats(ns, sleeveNumber);
-  const jobs = getPriorityJobs(ns, stats, true, usedJobs, { 
-    deprioritizeDonatable: CONFIG.DEPRIORITIZE_DONATABLE_FACTIONS 
-  });
-  
-  if (jobs.length === 0) return true;
-  
-  // Check if current job is still a valid priority job
-  const currentJobInPriority = jobs.find(j => j.name === currentJobName);
-  
-  if (!currentJobInPriority) {
-    // Current job is no longer a priority - reassign
-    return true;
-  }
-  
-  // Check if there's a significantly better job available
-  // Only reassign if the best job has much lower time units (e.g., 50% less)
-  const bestJob = jobs[0];
-  if (bestJob.name !== currentJobName) {
-    // Check if best job is significantly better (avoid constant thrashing)
-    const currentTimeUnits = currentJobInPriority.timeUnits;
-    const bestTimeUnits = bestJob.timeUnits;
-    
-    // Only switch if best job is at least 50% faster
-    if (bestTimeUnits < currentTimeUnits * 0.5) {
-      return true;
-    }
-  }
-  
-  // Check if we're doing the right activity type for our stats
-  const currentActivity = currentTask.factionWorkType || "unknown";
-  if (currentJobInPriority.activity !== currentActivity && currentJobInPriority.type === "faction") {
-    // Wrong activity type - reassign to get better rep gain
-    return true;
-  }
-  
-  return false;
 }
 
 /**

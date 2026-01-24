@@ -574,17 +574,23 @@ export function getPriorityJobs(ns, stats, forSleeves = false, excludedJobs = ne
     
     if (!nextAug) continue; // Already have enough rep for all key augs from this faction
     
+    // Calculate what favor we'll have after reset
+    const favorAfterReset = calculateFavorAfterReset(factionRep, factionFavor);
+    
+    // Calculate rep needed to reach 150 favor (donation threshold)
+    const repNeededFor150Favor = calculateRepNeededForFavor(factionFavor, FAVOR_DONATION_THRESHOLD);
+    
     // Apply donation threshold logic:
-    // If target requires 1M+ rep and we don't have 150 favor yet,
-    // cap the grind target at 460k (to reach 150 favor for next run)
+    // If target requires 1M+ rep and we won't have 150 favor after reset,
+    // cap the grind target at the rep needed to reach 150 favor
     let effectiveTarget = lowestRepNeeded;
     let cappedForDonation = false;
     
-    if (lowestRepNeeded >= HIGH_REP_AUG_THRESHOLD && factionFavor < FAVOR_DONATION_THRESHOLD) {
-      // Cap at the rep needed for donation threshold
+    if (lowestRepNeeded >= HIGH_REP_AUG_THRESHOLD && favorAfterReset < FAVOR_DONATION_THRESHOLD) {
+      // Cap at the rep needed for donation threshold (dynamic based on existing favor)
       // But only if we haven't already exceeded it
-      if (factionRep < REP_FOR_DONATION_FAVOR) {
-        effectiveTarget = REP_FOR_DONATION_FAVOR;
+      if (factionRep < repNeededFor150Favor) {
+        effectiveTarget = repNeededFor150Favor;
         cappedForDonation = true;
       }
     }
@@ -616,6 +622,7 @@ export function getPriorityJobs(ns, stats, forSleeves = false, excludedJobs = ne
       actualAugRep: lowestRepNeeded, // The real rep needed for the aug
       currentRep: factionRep,
       favor: factionFavor,
+      favorAfterReset: favorAfterReset,
       targetAug: nextAug,
       isDaedalusRedPill: isDaedalusRedPill,
       cappedForDonation: cappedForDonation,
@@ -636,17 +643,22 @@ export function getPriorityJobs(ns, stats, forSleeves = false, excludedJobs = ne
     // Check if faction is already unlocked
     const factionJoined = joinedFactions.includes(associatedFaction);
     
+    // Calculate favor after reset to determine if we need more rep for the 35 favor threshold
+    const favorAfterReset = calculateFavorAfterReset(companyRep, companyFavor);
+    const repNeededFor35Favor = calculateRepNeededForFavor(companyFavor, TARGET_FAVOR_AFTER_RESET);
+    
     // Determine company rep goal
     let targetRep;
     let goalDescription;
     
     if (!factionJoined && companyRep < COMPANY_FACTION_UNLOCK_REP) {
-      // Need to unlock faction - goal is 400k
-      if (companyRep < COMPANY_INITIAL_REP_GOAL) {
-        // First milestone: get to 25k for favor base
-        targetRep = COMPANY_INITIAL_REP_GOAL;
-        goalDescription = "initial_favor";
-      } else {
+      // Need to unlock faction - but first check favor threshold
+      if (favorAfterReset < TARGET_FAVOR_AFTER_RESET) {
+        // First milestone: get enough rep to reach 35 favor after reset
+        // This is dynamic based on existing favor!
+        targetRep = repNeededFor35Favor;
+        goalDescription = "favor_threshold";
+      } else if (companyRep < COMPANY_FACTION_UNLOCK_REP) {
         // Second milestone: get to 400k to unlock faction
         targetRep = COMPANY_FACTION_UNLOCK_REP;
         goalDescription = "unlock_faction";
@@ -659,6 +671,9 @@ export function getPriorityJobs(ns, stats, forSleeves = false, excludedJobs = ne
       continue;
     }
     
+    // Skip if we've already reached the target
+    if (companyRep >= targetRep) continue;
+    
     const timeUnits = calculateTimeUnits(companyRep, targetRep, companyFavor);
     const activity = getBestCompanyPosition(ns, stats, company);
     
@@ -670,6 +685,7 @@ export function getPriorityJobs(ns, stats, forSleeves = false, excludedJobs = ne
       targetRep: targetRep,
       currentRep: companyRep,
       favor: companyFavor,
+      favorAfterReset: favorAfterReset,
       goalDescription: goalDescription,
       associatedFaction: associatedFaction,
       isDaedalusRedPill: false,
