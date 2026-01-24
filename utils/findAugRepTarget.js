@@ -16,16 +16,16 @@ const KEY_AUGS = ["Cranial Signal Processors - Gen I", "Cranial Signal Processor
 "Xanipher", //+20% all skills
 "SmartJaw", //+50% charisma skill, xp, +25% factions & companies (high priority)
 "Enhanced Social Interaction Implant", //+60% cha stuff (4sigma)
-"CordiARC Fusion Reactor", //+35% all combat skills, +35% combat xp, pretty great!
+"CordiARC Fusion Reactor", //+35% all combat skills, +35% combat xp, pretty great! (megacorp ex))
 "Graphene BrachiBlades Upgrade", //upgrades for life of crime
-"Graphene Bionic Spine Upgrade", //+60% all combat skills, freakin awesome for sleeves
+"Graphene Bionic Spine Upgrade", //+60% all combat skills, freakin awesome for sleeves (ecorp, )
 "Graphene Bionic Arms Upgrade",
-"Graphene Bionic Legs Upgrade",
+"Graphene Bionic Legs Upgrade", //+150% agi, super useful for covenant + illuminati (megacorp, ecorp)
 "Graphene Bone Lacings",
 "SPTN-97 Gene Modification", //+75% all combat skills, +15% for hacking, even more awesome! (covenant ex)
-"PC Direct-Neural Interface", //+30% rep, prereq for following two
-"PC Direct-Neural Interface Optimization Submodule", //+75% rep from companies
-"PC Direct-Neural Interface NeuroNet Injector", //+100% rep from companies, essential for unlocking more factions
+"PC Direct-Neural Interface", //+30% rep, prereq for following two (omnitek, ecorp)
+"PC Direct-Neural Interface Optimization Submodule", //+75% rep from companies (fulcrum, ecorp)
+"PC Direct-Neural Interface NeuroNet Injector", //+100% rep from companies, essential for unlocking more factions, (fulcrum exclusive)
 "Neotra", //+55% STR, DEX
 "Hydroflame Left Arm", //+180% STR, last priority hopefully
 "nextSENS Gene Modification", //+20% all skills clarke ex
@@ -33,13 +33,12 @@ const KEY_AUGS = ["Cranial Signal Processors - Gen I", "Cranial Signal Processor
 "The Red Pill" //obviously!!!
 ]
 
-const KEY_GRAFTS = [
-  "BitRunners Neurolink", //Exclusive to bitrunners, needs 875k rep (3x nearest neighbor) and doesn't benefit sleeves much, does hack grow power stuff
-  "QLink", //Illuminati ultimate hacking - 50% hack skill but mostly in non-sleeve stuff. 7.5t
-  "violet Congruity Implant", // of course - removes penalties which by the end of the graft list means +(2*x)% to all stats
-  "Embedded Netburner Module Direct Memory Access Upgrade", //only hack power and chance
-  "Embedded Netburner Module Analyze Engine", //10% faster grow, weaken, hack - no sleeve
-  "ECorp HVMind Implant", //+some confusing ridiculous pct to grow power (3x)
+const PRIORITY_SORTED_FACTION_NAMES = [
+  "Fulcrum Secret Technologies", //contains all PC Direct-Neural stuff EXCEPT PREREQ, so this is NOT FIRST PRIORITY ACTUALLY, good for unlocking other companies ASAP (total of +200% company rep gain)
+  "Bachman & Associates", //SmartJaw upgrades faction and company rep gain, plus CHA. mostly want the rep gain
+  "NWO", //for Xanipher great all around, +20% all stats +15% all stats growth, good way to cancel worst effects of grafting entropy
+  "Four Sigma", //second last, upgrades charisma, mostly just useful for job upgrades
+  "Ecorp", //last, faction exclusive is only useful for player and thus grafted (edit: ecorp has PC Direct, changes value significantly)
 ]
 
 /** @param {NS} ns */

@@ -1,9 +1,13 @@
 /** @param {NS} ns */
 
+import { getNexusHost, getNexusDefaultName } from "/utils/nexus-util.js";
+import { isRamSaturated } from "utils/ram.js";
+
 const MIN_RAM = 2;        // Minimum RAM for new servers (2GB)
 const CYCLE_DELAY = 5000; // 5 seconds between cycles
-const NEXUS_NAME = "nexus"; // Name for the first purchased server
 const NEXUS_TARGET_RAM = 512; // Minimum RAM before nexus is considered "ready"
+const SATURATION_GRACE_MS = 5 * 60 * 1000;
+let saturatedSince = null;
 
 /**
  * Get target ram based on singularity cost (nexus scripts are singularity heavy)
@@ -71,24 +75,14 @@ function setupNexusServer(ns, nexusServer) {
  * @returns {string|null} The actual nexus server name, or null if not found
  */
 function findNexusServer(ns) {
-  const servers = ns.getPurchasedServers();
-  
-  // Check for exact match first
-  if (servers.includes(NEXUS_NAME)) {
-    return NEXUS_NAME;
+  const nexus = getNexusHost(ns, 64);
+
+  if (!nexus) {
+    ns.print("No nexus available");
+    return;
   }
   
-  // Check for numbered variant (nexus-0)
-  if (servers.includes(`${NEXUS_NAME}-0`)) {
-    return `${NEXUS_NAME}-0`;
-  }
-  
-  // If we have exactly 1 server and it starts with our prefix, assume it's nexus
-  if (servers.length === 1 && servers[0].startsWith(NEXUS_NAME)) {
-    return servers[0];
-  }
-  
-  return null;
+  return nexus;
 }
 
 /**
@@ -250,7 +244,7 @@ function printStatus(ns) {
   const nextAction = findBestAction(ns);
   if (nextAction) {
     if (nextAction.type === "buy") {
-      const serverName = servers.length === 0 ? NEXUS_NAME : `pserv-${servers.length}`;
+      const serverName = servers.length === 0 ? getNexusDefaultName(ns) : `pserv-${servers.length}`;
       ns.print(`  BUY new server "${serverName}" (${nextAction.ram} GB) for $${ns.formatNumber(nextAction.cost)}`);
     } else {
       const priorityTag = nextAction.priority ? " [PRIORITY]" : "";
@@ -302,24 +296,25 @@ function getMaxServerCost(ns) {
 export async function main(ns) {
   ns.disableLog("ALL");
   ns.tail();
+  const nexusDefaultName = getNexusDefaultName(ns)
   
   ns.print("Starting Server Upgrader...");
-  ns.print(`First server will be named: ${NEXUS_NAME} (may appear as ${NEXUS_NAME}-0)`);
-  ns.print(`Nexus target RAM: ${getNexusTargetRam(ns)} GB`);
+  ns.print(`First server will be named: ${nexusDefaultName} (may appear as ${nexusDefaultName}-0)`);
+  ns.print(`Nexus target RAM: ${NEXUS_TARGET_RAM} GB`);
   ns.print("");
   
   // Check for duplicate nexus situation
   const servers = ns.getPurchasedServers();
-  const hasNexus = servers.includes(NEXUS_NAME);
-  const hasNexus0 = servers.includes(`${NEXUS_NAME}-0`);
+  const hasNexus = servers.includes(nexusDefaultName);
+  const hasNexus0 = servers.includes(`${nexusDefaultName}-0`);
   
   if (hasNexus && hasNexus0) {
     ns.print("⚠️  WARNING: Duplicate nexus servers detected!");
-    ns.print(`Found both "${NEXUS_NAME}" and "${NEXUS_NAME}-0"`);
+    ns.print(`Found both "${nexusDefaultName}" and "${nexusDefaultName}-0"`);
     ns.print("");
     ns.print("Recommended fix:");
     ns.print(`1. Note which one has your scripts/processes running`);
-    ns.print(`2. Run: killall; ns.deleteServer("${NEXUS_NAME}") or ns.deleteServer("${NEXUS_NAME}-0")`);
+    ns.print(`2. Run: killall; ns.deleteServer("${nexusDefaultName}") or ns.deleteServer("${nexusDefaultName}-0")`);
     ns.print(`3. Restart this script`);
     ns.print("");
     ns.print("Continuing anyway - will treat both as nexus...");
@@ -367,7 +362,30 @@ export async function main(ns) {
         nexusScriptsLaunched = true;
       }
     }
-    
+
+    // gate findBestAction if we detect already saturated
+    const saturated = isRamSaturated(ns);
+
+    if (saturated && nexusScriptsLaunched) {
+      if (!saturatedSince) {
+        saturatedSince = Date.now();
+        ns.print("⚠️ RAM saturated — pausing server expansion");
+      }
+
+      // If saturated for long enough, exit cleanly (ignore in BN9, we still have stuff to do)
+      if (Date.now() - saturatedSince > SATURATION_GRACE_MS && ns.getResetInfo().currentNode !== 9) {
+        ns.print("🛑 RAM saturation persisted — shutting down server-upgrader");
+        await ns.sleep(10000);
+        ns.exit();
+      }
+
+      printStatus(ns);
+      await ns.sleep(CYCLE_DELAY);
+      continue;
+    } else {
+      saturatedSince = null;
+    }
+
     // Find and execute the best action
     const action = findBestAction(ns);
     
@@ -379,7 +397,7 @@ export async function main(ns) {
         
         if (!existingNexus) {
           // First server ever - this is nexus
-          desiredName = NEXUS_NAME;
+          desiredName = getNexusDefaultName(ns);
         } else {
           // We have nexus, so name by total server count (not serverIndex)
           desiredName = `pserv-${servers.length}`;
@@ -391,7 +409,7 @@ export async function main(ns) {
           ns.print(`[+] Purchased ${hostname} with ${action.ram} GB RAM`);
           
           // If this is nexus (first time we see it), set it up
-          if (!nexusSetupComplete && (hostname === NEXUS_NAME || hostname.startsWith(NEXUS_NAME))) {
+          if (!nexusSetupComplete && (hostname === getNexusHost(ns, 64))) {
             await ns.sleep(100); // Brief delay to ensure server is ready
             setupNexusServer(ns, hostname);
             nexusSetupComplete = true;

@@ -61,7 +61,7 @@ export async function main(ns) {
       
       // Check if any corp in this city needs attention
       for (const corp of corps) {
-        if (needsJobApplication(ns, corp) || canGetPromotion(ns, corp)) {
+        if (needsJobApplication(ns, corp)) {
           needsTravel = true;
           break;
         }
@@ -84,14 +84,6 @@ export async function main(ns) {
           const applied = applyForJob(ns, corp, args.debug);
           if (applied) {
             ns.print(`INFO: Got job at ${corp}`);
-          }
-        }
-        
-        // Try for promotion
-        if (canGetPromotion(ns, corp)) {
-          const promoted = tryPromotion(ns, corp, args.debug);
-          if (promoted) {
-            ns.print(`INFO: Promoted at ${corp}`);
           }
         }
       }
@@ -173,48 +165,4 @@ function applyForJob(ns, company, debug) {
   }
   
   return gotJob;
-}
-
-/**
- * Check if we might be eligible for a promotion
- * @param {NS} ns
- * @param {string} company
- * @returns {boolean}
- */
-function canGetPromotion(ns, company) {
-  const currentJob = getCurrentJob(ns, company);
-  if (!currentJob) return false;
-  
-  // We have a job - might be able to get promoted
-  // The game doesn't expose promotion requirements directly,
-  // so we just try periodically
-  return true;
-}
-
-/**
- * Try to get a promotion at a company
- * @param {NS} ns
- * @param {string} company
- * @param {boolean} debug
- * @returns {boolean}
- */
-function tryPromotion(ns, company, debug) {
-  const oldJob = getCurrentJob(ns, company);
-  
-  // Try to apply for a better position in the same field
-  // The game will give us the best position we qualify for
-  for (const field of JOB_FIELDS) {
-    ns.singularity.applyToCompany(company, field);
-  }
-  
-  const newJob = getCurrentJob(ns, company);
-  
-  if (newJob !== oldJob) {
-    if (debug) {
-      ns.print(`DEBUG: Promoted at ${company}: ${oldJob} -> ${newJob}`);
-    }
-    return true;
-  }
-  
-  return false;
 }

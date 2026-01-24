@@ -30,27 +30,59 @@ const MAX_PREP_THREAD_RATIO = 0.60;    // Max 60% of threads for prep tasks
 const TARGET_MONEY_AFTER_HACK = 0.05;  // Hack down to 5% of max
 const TARGET_MONEY_AFTER_GROW = 1.0;   // Grow to 100% of max
 
-// Priority prep targets - servers to prep first due to good ROI at various hacking levels
-// Format: { name: string, minHackLevel: number }
-const PRIORITY_PREP_TARGETS = [
-  { name: "joesguns", minHackLevel: 0 },
-  { name: "n00dles", minHackLevel: 0 },
-  { name: "harakiri-sushi", minHackLevel: 40 },
-  { name: "hong-fang-tea", minHackLevel: 30 },
-  { name: "nectar-net", minHackLevel: 20 },
-  { name: "silver-helix", minHackLevel: 150 },
-  { name: "omega-net", minHackLevel: 200 },
-  { name: "phantasy", minHackLevel: 100 },
-  { name: "max-hardware", minHackLevel: 80 },
-  { name: "iron-gym", minHackLevel: 100 },
+// Minimum growth rate to consider a server worth hacking
+// Servers with growth rate below this are blacklisted (e.g., fulcrumassets=1, foodnstuff=5)
+const MIN_GROWTH_RATE = 15;
+
+// Blacklisted servers - never hack these, they're not worth the thread cost
+// Generated from server-analyzer.js: servers with growthRate <= 10
+const BLACKLIST_SERVERS = [
+  "fulcrumassets",  // growth=1, needs 67k threads to grow, earns $368/s - absolute worst
+  "foodnstuff",     // growth=5, needs 3.9k threads, deceptively bad early game trap
+  "sigma-cosmetics", // growth=10, needs 1.9k threads
+  // NOTE: n00dles is NOT blacklisted despite low max money ($1.75m)
+  // Its growth rate of 3000 means only ~7 threads to fully grow
+  // Perfect bootstrapper: minimal thread cost, instant cycling, good early XP
 ];
+
+// Priority prep targets by hacking level tier
+// From server-analyzer.js output - best $/sec servers at each level range
+const PRIORITY_PREP_TARGETS_BY_LEVEL = {
+  // Level 1-100: Very early game - n00dles is the ultimate bootstrapper
+  // Only needs ~10 threads total to cycle, generates seed money while real targets prep
+  0: ["n00dles", "joesguns", "harakiri-sushi", "hong-fang-tea", "nectar-net", "neo-net"],
+  
+  // Level 101-300: Early game - n00dles still useful but diminishing returns
+  100: ["n00dles", "max-hardware", "joesguns", "harakiri-sushi", "zer0", "phantasy", "nectar-net"],
+  
+  // Level 301-500: Early-mid game - n00dles becomes irrelevant, drop from list
+  300: ["omega-net", "phantasy", "silver-helix", "crush-fitness", "max-hardware", "iron-gym"],
+  
+  // Level 501-700: Mid game
+  500: ["computek", "the-hub", "catalyst", "summit-uni", "rho-construction", "omega-net"],
+  
+  // Level 701-900: Mid-late game
+  700: ["rho-construction", "alpha-ent", "computek", "the-hub", "catalyst", "lexo-corp"],
+  
+  // Level 901-1100: Late game
+  900: ["alpha-ent", "rho-construction", "lexo-corp", "global-pharm", "zb-institute", "computek"],
+  
+  // Level 1101-1300: End game begins
+  1100: ["kuai-gong", "b-and-a", "4sigma", "blade", "nwo", "clarkinc", "megacorp", "omnitek"],
+  
+  // Level 1301-1500: End game
+  1300: ["ecorp", "megacorp", "nwo", "blade", "clarkinc", "b-and-a", "4sigma", "kuai-gong"],
+  
+  // Level 1501+: Max level
+  1500: ["ecorp", "megacorp", "nwo", "clarkinc", "blade", "b-and-a", "4sigma", "kuai-gong", "omnitek"],
+};
 
 // =============================================================================
 // SERVER STATE MACHINE
 // =============================================================================
 
 /**
- * @typedef {'UNPREPPED' | 'PREPPING' | 'READY' | 'HACKING' | 'WEAKEN_AFTER_HACK' | 'GROWING' | 'WEAKEN_AFTER_GROW'} ServerPhase
+ * @typedef {'UNPREPPED' | 'PREPPING' | 'READY' | 'HACKING' | 'WEAKEN_AFTER_HACK' | 'GROWING' | 'WEAKEN_AFTER_GROW' | 'HACK_WEAKEN' | 'GROW_WEAKEN'} ServerPhase
  */
 
 /**
@@ -59,9 +91,10 @@ const PRIORITY_PREP_TARGETS = [
  * @property {ServerPhase} phase
  * @property {number} batchStartTime - When current batch started (0 if none)
  * @property {number} batchEndTime - Expected completion time (0 if none)
- * @property {string} batchType - Current batch type: 'weaken', 'grow', 'hack', or ''
+ * @property {string} batchType - Current batch type: 'weaken', 'grow', 'hack', 'hack+weaken', 'grow+weaken', or ''
  * @property {number} batchThreads - Threads allocated to current batch
  * @property {number} profitScore - Cached profitability score
+ * @property {Object} [lastBatchInfo] - Debug info from last hack batch for diagnosing over-hacks
  */
 
 /** @type {Map<string, ServerState>} */
@@ -193,6 +226,8 @@ function clearBatch(state) {
 // =============================================================================
 
 const activityLog = [];
+const incidentLog = []; // Separate log for over-hacks and other incidents
+const MAX_INCIDENT_LOG = 20; // Keep more incidents since they're rare
 let lastBackdoorWarning = 0;
 
 /**
@@ -204,6 +239,18 @@ function logActivity(message) {
   activityLog.unshift(`[${timestamp}] ${message}`);
   while (activityLog.length > MAX_ACTIVITY_LOG) {
     activityLog.pop();
+  }
+}
+
+/**
+ * Add an entry to the incident log (for over-hacks and other issues)
+ * @param {string} message
+ */
+function logIncident(message) {
+  const timestamp = new Date().toLocaleTimeString();
+  incidentLog.unshift(`[${timestamp}] ${message}`);
+  while (incidentLog.length > MAX_INCIDENT_LOG) {
+    incidentLog.pop();
   }
 }
 
@@ -287,6 +334,16 @@ function calcHackThreads(ns, target) {
   // threads * hackPercent * current >= toSteal
   // threads >= toSteal / (hackPercent * current)
   const threadsNeeded = Math.ceil(toSteal / (hackPercent * current));
+  
+  // Calculate expected outcome
+  const expectedStealPercent = threadsNeeded * hackPercent;
+  const expectedMoneyAfter = current * (1 - expectedStealPercent);
+  
+  // If this looks like it will over-hack, log it
+  if (expectedMoneyAfter < 0 || expectedStealPercent > 0.99) {
+    logIncident(`🧮 CALC WARNING ${target}: ${threadsNeeded}t × ${(hackPercent*100).toFixed(4)}% = ${(expectedStealPercent*100).toFixed(1)}% steal`);
+    logIncident(`   cur=$${ns.formatNumber(current)} max=$${ns.formatNumber(max)} target=$${ns.formatNumber(targetMoney)} after=$${ns.formatNumber(expectedMoneyAfter)}`);
+  }
   
   return threadsNeeded;
 }
@@ -372,9 +429,16 @@ function getSortedTargets(ns, targetServers) {
   // Filter to hackable targets and calculate scores
   const scored = [];
   for (const target of targetServers) {
+    // Skip blacklisted servers entirely
+    if (BLACKLIST_SERVERS.includes(target)) continue;
+    
     if (!ns.hasRootAccess(target)) continue;
     if (ns.getServerRequiredHackingLevel(target) > hackLevel) continue;
     if (ns.getServerMaxMoney(target) <= 0) continue;
+    
+    // Also skip servers with very low growth rate (dynamic check)
+    const growthRate = ns.getServerGrowth(target);
+    if (growthRate < MIN_GROWTH_RATE) continue;
     
     const score = calcProfitScore(ns, target);
     scored.push({ target, score });
@@ -399,16 +463,27 @@ function getSortedTargets(ns, targetServers) {
 function getPriorityPrepTargets(ns, unprepedServers) {
   const hackLevel = ns.getHackingLevel();
   
-  // Build priority list based on config
-  const priorityNames = PRIORITY_PREP_TARGETS
-    .filter(p => p.minHackLevel <= hackLevel)
-    .map(p => p.name);
+  // Filter out blacklisted servers first
+  const validServers = unprepedServers.filter(s => !BLACKLIST_SERVERS.includes(s));
+  
+  // Find the appropriate priority list for current hacking level
+  const levelTiers = Object.keys(PRIORITY_PREP_TARGETS_BY_LEVEL)
+    .map(Number)
+    .sort((a, b) => b - a); // Sort descending
+  
+  let priorityNames = [];
+  for (const tier of levelTiers) {
+    if (hackLevel >= tier) {
+      priorityNames = PRIORITY_PREP_TARGETS_BY_LEVEL[tier];
+      break;
+    }
+  }
   
   // Partition into priority and non-priority
   const priority = [];
   const rest = [];
   
-  for (const server of unprepedServers) {
+  for (const server of validServers) {
     if (priorityNames.includes(server)) {
       priority.push(server);
     } else {
@@ -548,9 +623,16 @@ function executePrepBatch(ns, target, runners, maxThreads) {
   const weakenNeeded = calcWeakenThreads(ns, target);
   const growNeeded = calcGrowThreads(ns, target);
   
+  // Skip if nothing actually needed (server might already be prepped)
+  if (weakenNeeded <= 0 && growNeeded <= 0) {
+    return { deployed: 0, type: '', duration: 0 };
+  }
+  
   // Prioritize weaken if security is high
   if (weakenNeeded > 0) {
     const threads = Math.min(weakenNeeded, maxThreads);
+    if (threads <= 0) return { deployed: 0, type: '', duration: 0 };
+    
     const deployed = executeDistributed(ns, "weaken.js", threads, target, runners);
     
     if (deployed > 0) {
@@ -563,6 +645,8 @@ function executePrepBatch(ns, target, runners, maxThreads) {
     }
   } else if (growNeeded > 0) {
     const threads = Math.min(growNeeded, maxThreads);
+    if (threads <= 0) return { deployed: 0, type: '', duration: 0 };
+    
     const deployed = executeDistributed(ns, "grow.js", threads, target, runners);
     
     if (deployed > 0) {
@@ -618,38 +702,236 @@ function getDebugTimes(ns, target) {
 }
 
 /**
- * Execute a hack cycle batch
- * Returns after the full hack -> weaken sequence completes
+ * Execute a combined Hack + Weaken batch with proper timing
+ * Launches weaken first, then hack with delay so hack lands just before weaken
  * @param {NS} ns
  * @param {string} target
  * @param {{name: string, cores: number, availableRam: number}[]} runners
- * @returns {{deployed: number, type: string, duration: number}}
+ * @returns {{deployed: number, type: string, duration: number, hackThreads: number, weakenThreads: number}}
  */
-function executeHackBatch(ns, target, runners) {
+function executeHackWeakenBatch(ns, target, runners) {
   const state = getServerState(target);
+  
+  // Check for existing scripts - this shouldn't happen but let's detect it
+  const existingThreads = getRunningThreadsForTarget(ns, runners.map(r => r.name), target);
+  const hasExisting = existingThreads.hack > 0 || existingThreads.grow > 0 || existingThreads.weaken > 0;
+  if (hasExisting) {
+    logIncident(`🔄 OVERLAP detected on ${target} before H+W: H=${existingThreads.hack} G=${existingThreads.grow} W=${existingThreads.weaken}`);
+  }
   
   const hackThreads = calcHackThreads(ns, target);
   if (hackThreads <= 0) {
-    // Nothing to hack, transition to grow
+    // Nothing to hack - debug why
+    const current = ns.getServerMoneyAvailable(target);
+    const max = ns.getServerMaxMoney(target);
+    const pct = max > 0 ? (current / max * 100).toFixed(1) : 0;
+    const server = ns.getServer(target);
+    const player = ns.getPlayer();
+    const hackPct = ns.formulas.hacking.hackPercent(server, player);
+    logActivity(`⏸️ H+W ${target}: hackThreads=0, money=${pct}%, hackPct=${(hackPct*100).toFixed(4)}%`);
+    
+    // Transition to grow
     state.phase = 'GROWING';
-    return { deployed: 0, type: '', duration: 0 };
+    return { deployed: 0, type: '', duration: 0, hackThreads: 0, weakenThreads: 0 };
   }
   
-  const deployed = executeDistributed(ns, "hack.js", hackThreads, target, runners);
+  // Calculate weaken threads needed to counter hack security increase
+  const securityIncrease = calcSecurityIncrease('hack', hackThreads);
+  const weakenThreads = calcCounterWeakenThreads(ns, securityIncrease);
   
-  if (deployed > 0) {
-    const duration = ns.getHackTime(target);
-    startBatch(state, 'hack', duration, deployed);
-    state.phase = 'HACKING';
-    
-    const expectedSteal = ns.hackAnalyze(target) * deployed * ns.getServerMoneyAvailable(target);
-    const timeStr = formatDuration(duration);
-    logActivity(`💰 HACK ${target}: ${deployed}t → $${ns.formatNumber(expectedSteal)}, ${timeStr}`);
-    
-    return { deployed, type: 'hack', duration };
+  // Get timing info
+  const hackTime = ns.getHackTime(target);
+  const weakenTime = ns.getWeakenTime(target);
+  
+  // Calculate delay for hack so it lands 200ms before weaken
+  // Weaken lands at: weakenTime (launched at t=0)
+  // Hack lands at: hackDelay + hackTime
+  // We want: hackDelay + hackTime = weakenTime - 200ms
+  // So: hackDelay = weakenTime - hackTime - 200
+  const LAND_BUFFER = 200; // ms before weaken that hack should land
+  const hackDelay = Math.max(0, weakenTime - hackTime - LAND_BUFFER);
+  
+  // Log timing details for debugging
+  const currentMoney = ns.getServerMoneyAvailable(target);
+  const maxMoney = ns.getServerMaxMoney(target);
+  const currentSec = ns.getServerSecurityLevel(target);
+  const minSec = ns.getServerMinSecurityLevel(target);
+  
+  // Check if server is backdoored (hack time would be 25% less)
+  const server = ns.getServer(target);
+  const isBackdoored = server.backdoorInstalled;
+  
+  // Get runner names for refresh
+  const runnerNames = runners.map(r => r.name);
+  
+  // Check if we have enough RAM for both operations BEFORE deploying anything
+  const hackRam = ns.getScriptRam("hack.js");
+  const weakenRam = ns.getScriptRam("weaken.js");
+  let totalRamNeeded = (hackThreads * hackRam) + (weakenThreads * weakenRam);
+  
+  let totalAvailableRam = 0;
+  for (const runner of runners) {
+    totalAvailableRam += runner.availableRam;
   }
   
-  return { deployed: 0, type: '', duration: 0 };
+  // If not enough RAM, try to scale down hack threads to fit
+  // This is especially important for early game bootstrapping
+  let adjustedHackThreads = hackThreads;
+  let adjustedWeakenThreads = weakenThreads;
+  
+  if (totalAvailableRam < totalRamNeeded) {
+    // Calculate max hack threads that will fit
+    // We need: (hackThreads * hackRam) + (weakenThreads * weakenRam) <= availableRam
+    // Weaken threads = ceil(hackThreads * 0.002 / 0.05) = ceil(hackThreads * 0.04)
+    // Let h = hack threads, then weaken = ceil(h * 0.04)
+    // h * hackRam + ceil(h * 0.04) * weakenRam <= availableRam
+    // 
+    // Be conservative: assume worst case weaken overhead
+    // At minimum, 1 weaken thread per batch, plus ceil() rounding
+    // Use slightly higher ratio to ensure we don't overshoot
+    const ramPerHackWithWeaken = hackRam + (0.05 * weakenRam); // Slightly conservative
+    let maxAffordableHackThreads = Math.floor(totalAvailableRam / ramPerHackWithWeaken);
+    
+    // Binary search to find actual max that fits (handles edge cases)
+    while (maxAffordableHackThreads > 0) {
+      const testSecIncrease = calcSecurityIncrease('hack', maxAffordableHackThreads);
+      const testWeakenThreads = calcCounterWeakenThreads(ns, testSecIncrease);
+      const testRamNeeded = (maxAffordableHackThreads * hackRam) + (testWeakenThreads * weakenRam);
+      
+      if (testRamNeeded <= totalAvailableRam) {
+        break; // Found a valid count
+      }
+      maxAffordableHackThreads--;
+    }
+    
+    // Minimum 1 hack thread to be worth doing
+    const MIN_HACK_THREADS = 1;
+    
+    if (maxAffordableHackThreads >= MIN_HACK_THREADS) {
+      adjustedHackThreads = maxAffordableHackThreads;
+      const adjustedSecIncrease = calcSecurityIncrease('hack', adjustedHackThreads);
+      adjustedWeakenThreads = calcCounterWeakenThreads(ns, adjustedSecIncrease);
+      totalRamNeeded = (adjustedHackThreads * hackRam) + (adjustedWeakenThreads * weakenRam);
+      
+      // Final verification (should always pass now but keep for safety)
+      if (totalAvailableRam < totalRamNeeded) {
+        return { deployed: 0, type: '', duration: 0, hackThreads: 0, weakenThreads: 0 };
+      }
+    } else {
+      // Can't even afford minimum threads
+      return { deployed: 0, type: '', duration: 0, hackThreads: 0, weakenThreads: 0 };
+    }
+  }
+  
+  // Deploy weaken first (no delay)
+  const weakenDeployed = adjustedWeakenThreads > 0 
+    ? executeDistributed(ns, "weaken.js", adjustedWeakenThreads, target, runners)
+    : 0;
+  
+  // Refresh runners after weaken deployment
+  const refreshedRunners = getSortedRunnersFromNames(ns, runnerNames);
+  
+  // Deploy hack with delay
+  const hackDeployed = executeDistributedWithDelay(ns, "hack.js", adjustedHackThreads, target, refreshedRunners, hackDelay);
+  
+  if (hackDeployed > 0) {
+    // Batch duration is when weaken completes (the last operation)
+    const batchDuration = weakenTime;
+    startBatch(state, 'hack+weaken', batchDuration, hackDeployed + weakenDeployed);
+    state.phase = 'HACK_WEAKEN';
+    
+    // Store timing info for post-batch analysis
+    state.lastBatchInfo = {
+      type: 'hack+weaken',
+      hackThreads: hackDeployed,
+      weakenThreads: weakenDeployed,
+      hackTime,
+      weakenTime,
+      hackDelay,
+      preMoney: currentMoney,
+      maxMoney,
+      preSecurity: currentSec,
+      minSecurity: minSec,
+      expectedSecIncrease: securityIncrease,
+      isBackdoored,
+      hadOverlap: hasExisting,
+      timestamp: Date.now()
+    };
+    
+    const expectedSteal = ns.hackAnalyze(target) * hackDeployed * currentMoney;
+    const bdFlag = isBackdoored ? ' [BD]' : '';
+    logActivity(`⚡ H+W ${target}${bdFlag}: H=${hackDeployed}t W=${weakenDeployed}t → $${ns.formatNumber(expectedSteal)}, ${formatDuration(batchDuration)}`);
+    
+    return { 
+      deployed: hackDeployed + weakenDeployed, 
+      type: 'hack+weaken', 
+      duration: batchDuration,
+      hackThreads: hackDeployed,
+      weakenThreads: weakenDeployed
+    };
+  }
+  
+  return { deployed: 0, type: '', duration: 0, hackThreads: 0, weakenThreads: 0 };
+}
+
+/**
+ * Execute scripts with a delay parameter
+ * @param {NS} ns
+ * @param {string} script
+ * @param {number} totalThreads
+ * @param {string} target
+ * @param {{name: string, cores: number, availableRam: number}[]} runners
+ * @param {number} delayMs
+ * @returns {number} Actual threads deployed
+ */
+function executeDistributedWithDelay(ns, script, totalThreads, target, runners, delayMs) {
+  const scriptRam = ns.getScriptRam(script);
+  if (scriptRam <= 0 || totalThreads <= 0) return 0;
+  
+  let deployed = 0;
+  
+  for (const runner of runners) {
+    if (deployed >= totalThreads) break;
+    
+    const maxThreads = Math.floor(runner.availableRam / scriptRam);
+    if (maxThreads <= 0) continue;
+    
+    const threadsToRun = Math.min(maxThreads, totalThreads - deployed);
+    
+    // Execute with delay parameter
+    const pid = ns.exec(script, runner.name, threadsToRun, target, delayMs);
+    
+    if (pid > 0) {
+      deployed += threadsToRun;
+      runner.availableRam -= threadsToRun * scriptRam;
+    }
+  }
+  
+  return deployed;
+}
+
+/**
+ * Helper to get fresh runner list from server names
+ * @param {NS} ns
+ * @param {string[]} runnerNames
+ * @returns {{name: string, cores: number, availableRam: number}[]}
+ */
+function getSortedRunnersFromNames(ns, runnerNames) {
+  const result = [];
+  
+  for (const name of runnerNames) {
+    const maxRam = ns.getServerMaxRam(name);
+    const usedRam = ns.getServerUsedRam(name);
+    const availableRam = maxRam - usedRam;
+    const cores = ns.getServer(name).cpuCores;
+    
+    if (availableRam > 0) {
+      result.push({ name, cores, availableRam });
+    }
+  }
+  
+  result.sort((a, b) => b.cores - a.cores);
+  return result;
 }
 
 /**
@@ -685,35 +967,171 @@ function executePostHackWeaken(ns, target, hackThreadsUsed, runners) {
 }
 
 /**
- * Execute a grow cycle batch
+ * Execute a combined Grow + Weaken batch with proper timing
+ * Launches weaken first, then grow with delay so grow lands just before weaken
  * @param {NS} ns
  * @param {string} target
  * @param {{name: string, cores: number, availableRam: number}[]} runners
- * @returns {{deployed: number, type: string, duration: number}}
+ * @param {string[]} runnerNames - List of runner server names for refresh
+ * @returns {{deployed: number, type: string, duration: number, growThreads: number, weakenThreads: number}}
  */
-function executeGrowBatch(ns, target, runners) {
+function executeGrowWeakenBatch(ns, target, runners, runnerNames) {
   const state = getServerState(target);
+  
+  const currentMoney = ns.getServerMoneyAvailable(target);
+  const maxMoney = ns.getServerMaxMoney(target);
+  const moneyPercent = maxMoney > 0 ? (currentMoney / maxMoney * 100) : 0;
+  
+  // Detect over-hacked condition - only flag if significantly below target
+  // TARGET_MONEY_AFTER_HACK is 5%, so anything below 4% is a real problem
+  const OVER_HACK_THRESHOLD = 0.04; // Less than 4% money = something actually went wrong
+  const isOverHacked = maxMoney > 0 && currentMoney < maxMoney * OVER_HACK_THRESHOLD;
+  
+  if (isOverHacked) {
+    if (state.lastBatchInfo) {
+      const info = state.lastBatchInfo;
+      const timingDetails = `hDel=${info.hackDelay}ms hTime=${info.hackTime}ms wTime=${info.weakenTime}ms`;
+      const threadDetails = `H=${info.hackThreads}t W=${info.weakenThreads}t`;
+      const moneyDetails = `pre=$${ns.formatNumber(info.preMoney)} now=$${ns.formatNumber(currentMoney)} (${moneyPercent.toFixed(2)}%)`;
+      const secDetails = `preSec=${info.preSecurity.toFixed(1)} min=${info.minSecurity} +${info.expectedSecIncrease.toFixed(3)}`;
+      
+      // Calculate if timing was the problem
+      const expectedHackLand = info.hackDelay + info.hackTime;
+      const timingMargin = info.weakenTime - expectedHackLand;
+      const timingStatus = timingMargin > 0 ? `OK (${timingMargin}ms margin)` : `BAD (hack landed ${-timingMargin}ms AFTER weaken)`;
+      
+      // Flags for special conditions
+      const flags = [];
+      if (info.isBackdoored) flags.push('BACKDOORED');
+      if (info.hadOverlap) flags.push('HAD_OVERLAP');
+      const flagStr = flags.length > 0 ? ` [${flags.join(', ')}]` : '';
+      
+      logIncident(`⚠️ OVER-HACK ${target}${flagStr}`);
+      logIncident(`   Money: ${moneyDetails}`);
+      logIncident(`   Timing: ${timingDetails}`);
+      logIncident(`   Expected landing: ${timingStatus}`);
+      logIncident(`   ${threadDetails} | ${secDetails}`);
+    } else {
+      // No lastBatchInfo - might be from a previous run or prep issue
+      logIncident(`⚠️ OVER-HACK ${target}: ${moneyPercent.toFixed(2)}% money (no batch info - maybe from previous run?)`);
+    }
+  }
   
   const growThreads = calcGrowThreads(ns, target);
   if (growThreads <= 0) {
     // Already at max money, go back to hack
     state.phase = 'READY';
-    return { deployed: 0, type: '', duration: 0 };
+    return { deployed: 0, type: '', duration: 0, growThreads: 0, weakenThreads: 0 };
   }
   
-  const deployed = executeDistributed(ns, "grow.js", growThreads, target, runners);
-  
-  if (deployed > 0) {
-    const duration = ns.getGrowTime(target);
-    startBatch(state, 'grow', duration, deployed);
-    state.phase = 'GROWING';
+  // Log if grow threads seem excessive (indicator of over-hack or just hard-to-grow server)
+  const EXCESSIVE_GROW_THRESHOLD = 5000;
+  if (growThreads > EXCESSIVE_GROW_THRESHOLD) {
+    const serverGrowth = ns.getServerGrowth(target);
+    const currentSec = ns.getServerSecurityLevel(target);
+    const minSec = ns.getServerMinSecurityLevel(target);
     
-    const timeStr = formatDuration(duration);
-    logActivity(`📈 GROW ${target}: ${deployed}t, ${timeStr}`);
-    return { deployed, type: 'grow', duration };
+    logIncident(`📊 Large grow: ${target} needs ${growThreads}t (${moneyPercent.toFixed(1)}% money)`);
+    logIncident(`   Server stats: growthRate=${serverGrowth}, security=${currentSec.toFixed(1)}/${minSec}, max=$${ns.formatNumber(maxMoney)}`);
+    
+    // Add batch info if available for debugging
+    if (state.lastBatchInfo) {
+      const info = state.lastBatchInfo;
+      const expectedHackLand = info.hackDelay + info.hackTime;
+      const timingMargin = info.weakenTime - expectedHackLand;
+      logIncident(`   Last H+W: H=${info.hackThreads}t W=${info.weakenThreads}t, margin=${timingMargin.toFixed(0)}ms`);
+      logIncident(`   Pre-hack money: $${ns.formatNumber(info.preMoney)} (${(info.preMoney/info.maxMoney*100).toFixed(1)}%)`);
+    }
   }
   
-  return { deployed: 0, type: '', duration: 0 };
+  // Calculate weaken threads needed to counter grow security increase
+  const securityIncrease = calcSecurityIncrease('grow', growThreads);
+  let weakenThreads = calcCounterWeakenThreads(ns, securityIncrease);
+  
+  // Get timing info
+  const growTime = ns.getGrowTime(target);
+  const weakenTime = ns.getWeakenTime(target);
+  
+  // Calculate delay for grow so it lands 200ms before weaken
+  const LAND_BUFFER = 200;
+  const growDelay = Math.max(0, weakenTime - growTime - LAND_BUFFER);
+  
+  // Check if we have enough RAM for both operations BEFORE deploying anything
+  const growRam = ns.getScriptRam("grow.js");
+  const weakenRam = ns.getScriptRam("weaken.js");
+  let totalRamNeeded = (growThreads * growRam) + (weakenThreads * weakenRam);
+  
+  let totalAvailableRam = 0;
+  for (const runner of runners) {
+    totalAvailableRam += runner.availableRam;
+  }
+  
+  // If not enough RAM, try to scale down grow threads to fit
+  let adjustedGrowThreads = growThreads;
+  let adjustedWeakenThreads = weakenThreads;
+  
+  if (totalAvailableRam < totalRamNeeded) {
+    // Grow uses 0.004 security per thread, weaken removes 0.05 per thread
+    // So weaken = ceil(grow * 0.004 / 0.05) = ceil(grow * 0.08)
+    const ramPerGrowWithWeaken = growRam + (0.1 * weakenRam); // Conservative estimate
+    let maxAffordableGrowThreads = Math.floor(totalAvailableRam / ramPerGrowWithWeaken);
+    
+    // Binary search to find actual max that fits
+    while (maxAffordableGrowThreads > 0) {
+      const testSecIncrease = calcSecurityIncrease('grow', maxAffordableGrowThreads);
+      const testWeakenThreads = calcCounterWeakenThreads(ns, testSecIncrease);
+      const testRamNeeded = (maxAffordableGrowThreads * growRam) + (testWeakenThreads * weakenRam);
+      
+      if (testRamNeeded <= totalAvailableRam) {
+        break;
+      }
+      maxAffordableGrowThreads--;
+    }
+    
+    // Need at least 1 grow thread
+    if (maxAffordableGrowThreads >= 1) {
+      adjustedGrowThreads = maxAffordableGrowThreads;
+      const adjustedSecIncrease = calcSecurityIncrease('grow', adjustedGrowThreads);
+      adjustedWeakenThreads = calcCounterWeakenThreads(ns, adjustedSecIncrease);
+      totalRamNeeded = (adjustedGrowThreads * growRam) + (adjustedWeakenThreads * weakenRam);
+      
+      if (totalAvailableRam < totalRamNeeded) {
+        return { deployed: 0, type: '', duration: 0, growThreads: 0, weakenThreads: 0 };
+      }
+    } else {
+      return { deployed: 0, type: '', duration: 0, growThreads: 0, weakenThreads: 0 };
+    }
+  }
+  
+  // Deploy weaken first (no delay)
+  const weakenDeployed = adjustedWeakenThreads > 0
+    ? executeDistributed(ns, "weaken.js", adjustedWeakenThreads, target, runners)
+    : 0;
+  
+  // Refresh runners after weaken deployment
+  const refreshedRunners = getSortedRunnersFromNames(ns, runnerNames);
+  
+  // Deploy grow with delay
+  const growDeployed = executeDistributedWithDelay(ns, "grow.js", adjustedGrowThreads, target, refreshedRunners, growDelay);
+  
+  if (growDeployed > 0) {
+    // Batch duration is when weaken completes (the last operation)
+    const batchDuration = weakenTime;
+    startBatch(state, 'grow+weaken', batchDuration, growDeployed + weakenDeployed);
+    state.phase = 'GROW_WEAKEN';
+    
+    logActivity(`⚡ G+W ${target}: G=${growDeployed}t W=${weakenDeployed}t, ${formatDuration(batchDuration)}`);
+    
+    return {
+      deployed: growDeployed + weakenDeployed,
+      type: 'grow+weaken',
+      duration: batchDuration,
+      growThreads: growDeployed,
+      weakenThreads: weakenDeployed
+    };
+  }
+  
+  return { deployed: 0, type: '', duration: 0, growThreads: 0, weakenThreads: 0 };
 }
 
 /**
@@ -926,8 +1344,9 @@ function printStatus(ns, stats, runners) {
       if (batch.threads.grow > 0) parts.push(`G:${batch.threads.grow}`);
       if (batch.threads.weaken > 0) parts.push(`W:${batch.threads.weaken}`);
       
+      const pct = ns.getServerMoneyAvailable(batch.target) / ns.getServerMaxMoney(batch.target);
       const isPrep = batch.phase === 'PREPPING' || batch.phase === 'UNPREPPED';
-      const phaseStr = isPrep ? '[PREP]' : '';
+      const phaseStr = isPrep ? '[PREP ' + ns.formatPercent(pct) + ']' : '';
       
       ns.print(`  ${batch.target} ${phaseStr}: ${parts.join(' ')} (${batch.total}t)`);
     }
@@ -938,12 +1357,24 @@ function printStatus(ns, stats, runners) {
   
   ns.print("");
   
-  // Recent activity
+  // Incidents (over-hacks, etc) - shown first since they're important
+  if (incidentLog.length > 0) {
+    ns.print("─── ⚠️ INCIDENTS ───");
+    for (const entry of incidentLog.slice(0, 8)) {
+      ns.print(`  ${entry}`);
+    }
+    if (incidentLog.length > 8) {
+      ns.print(`  ... and ${incidentLog.length - 8} more`);
+    }
+    ns.print("");
+  }
+  
+  // Recent activity (reduced to 6 entries to make room)
   ns.print("─── RECENT ACTIVITY ───");
   if (activityLog.length === 0) {
     ns.print("  (waiting for activity...)");
   } else {
-    for (const entry of activityLog) {
+    for (const entry of activityLog.slice(0, 6)) {
       ns.print(`  ${entry}`);
     }
   }
@@ -1031,13 +1462,32 @@ export async function main(ns) {
         } else if (threads.weaken > 0) {
           batchType = 'weaken';
           duration = ns.getWeakenTime(target);
-          state.phase = 'PREPPING'; // Weaken is usually prep
+          // Weaken could be prep OR post-hack/post-grow cycle weaken
+          // If server is already at min security, this is likely a cycle weaken
+          const security = ns.getServerSecurityLevel(target);
+          const minSec = ns.getServerMinSecurityLevel(target);
+          if (security <= minSec + 0.1) {
+            // Server is basically at min security - this is a post-operation weaken
+            // Check money to determine if it's post-hack or post-grow
+            const money = ns.getServerMoneyAvailable(target);
+            const maxMoney = ns.getServerMaxMoney(target);
+            if (maxMoney > 0 && money < maxMoney * 0.5) {
+              // Low money = probably post-hack, need to grow next
+              state.phase = 'WEAKEN_AFTER_HACK';
+            } else {
+              // High money = probably post-grow, ready for hack next
+              state.phase = 'WEAKEN_AFTER_GROW';
+            }
+          } else {
+            // Security is elevated - this is prep
+            state.phase = 'PREPPING';
+          }
         }
         
         if (batchType) {
           // Estimate when it will finish (assume it just started - conservative)
           startBatch(state, batchType, duration, total);
-          logActivity(`🔄 Recovered ${batchType} batch: ${target} (${total}t)`);
+          logActivity(`🔄 Recovered ${batchType} batch: ${target} (${total}t, phase=${state.phase})`);
         }
       }
     }
@@ -1072,7 +1522,7 @@ export async function main(ns) {
       // No scripts running - check state to determine next action
       // Key insight: these phases mean we're mid-cycle,
       // even if the server doesn't look "prepped" right now (due to security increase)
-      const cyclingPhases = ['HACKING', 'WEAKEN_AFTER_HACK', 'GROWING', 'WEAKEN_AFTER_GROW'];
+      const cyclingPhases = ['HACKING', 'WEAKEN_AFTER_HACK', 'GROWING', 'WEAKEN_AFTER_GROW', 'HACK_WEAKEN', 'GROW_WEAKEN'];
       
       if (cyclingPhases.includes(state.phase)) {
         // Mid-cycle server that just finished an operation
@@ -1140,8 +1590,19 @@ export async function main(ns) {
     for (const target of [...prepped]) {
       const state = getServerState(target);
       
-      // Check for state transitions that need follow-up actions
-      if (state.phase === 'HACKING') {
+      // Combined batches: HACK_WEAKEN and GROW_WEAKEN complete together
+      if (state.phase === 'HACK_WEAKEN') {
+        // Hack+Weaken batch completed, now need to grow
+        clearBatch(state);
+        state.phase = 'GROWING';
+        // Will be handled in Phase 7
+      } else if (state.phase === 'GROW_WEAKEN') {
+        // Grow+Weaken batch completed, back to ready for hack
+        clearBatch(state);
+        state.phase = 'READY';
+      }
+      // Legacy sequential phases (kept for compatibility during transition)
+      else if (state.phase === 'HACKING') {
         // Just finished hack, need post-hack weaken
         const hackThreadsUsed = state.batchThreads || 1;
         clearBatch(state);
@@ -1150,19 +1611,16 @@ export async function main(ns) {
         const result = executePostHackWeaken(ns, target, hackThreadsUsed, runners);
         if (result.deployed > 0) {
           cycleThreadsUsed += result.deployed;
-          // Move from prepped to cycling
           const idx = prepped.indexOf(target);
           if (idx >= 0) prepped.splice(idx, 1);
           cycling.push(target);
         } else {
-          // No weaken needed, go straight to grow
           state.phase = 'GROWING';
         }
       } else if (state.phase === 'WEAKEN_AFTER_HACK') {
         // Just finished post-hack weaken, now need to grow
         clearBatch(state);
         state.phase = 'GROWING';
-        // Will be handled in Phase 7 as a "ready to grow" server
       } else if (state.phase === 'GROWING') {
         // Just finished grow, need post-grow weaken
         const growThreadsUsed = state.batchThreads || 1;
@@ -1176,7 +1634,6 @@ export async function main(ns) {
           if (idx >= 0) prepped.splice(idx, 1);
           cycling.push(target);
         } else {
-          // No weaken needed, back to ready
           state.phase = 'READY';
         }
       } else if (state.phase === 'WEAKEN_AFTER_GROW') {
@@ -1238,8 +1695,8 @@ export async function main(ns) {
       if (runners.length === 0) break;
       
       if (state.phase === 'GROWING') {
-        // Server is mid-cycle and needs grow
-        const result = executeGrowBatch(ns, target, runners);
+        // Server is mid-cycle and needs grow+weaken
+        const result = executeGrowWeakenBatch(ns, target, runners, runnerServers);
         if (result.deployed > 0) {
           cycleThreadsUsed += result.deployed;
         }
@@ -1250,15 +1707,20 @@ export async function main(ns) {
         const moneyRatio = maxMoney > 0 ? money / maxMoney : 0;
         
         if (moneyRatio >= MONEY_THRESHOLD) {
-          // Ready to hack
-          const result = executeHackBatch(ns, target, runners);
+          // Ready to hack - use combined hack+weaken batch
+          const result = executeHackWeakenBatch(ns, target, runners);
           if (result.deployed > 0) {
             cycleThreadsUsed += result.deployed;
-            hackingThreads += result.deployed;
+            hackingThreads += result.hackThreads;
+          } else {
+            // Debug: why didn't batch deploy?
+            let totalAvail = 0;
+            for (const r of runners) totalAvail += r.availableRam;
+            logActivity(`⏸️ H+W ${target} skipped: runners=${runners.length}, availRAM=${totalAvail.toFixed(1)}GB`);
           }
         } else {
           // Need to grow first (shouldn't happen often for READY servers)
-          const result = executeGrowBatch(ns, target, runners);
+          const result = executeGrowWeakenBatch(ns, target, runners, runnerServers);
           if (result.deployed > 0) {
             cycleThreadsUsed += result.deployed;
           }
