@@ -2,7 +2,14 @@
 
 import { getAllServers, categorizeServers } from "/utils/scanner.js";
 import { tryNuke } from "/utils/nuker.js";
-import { getNexusTargetRam } from "server-upgrader.js";
+import { 
+  getNexusTargetRam, 
+  getRunnerServers, 
+  getReservedServers,
+  getNexusInfo,
+  getHacknetServers,
+  hasHacknetServers,
+} from "utils/server-utils.js";
 
 // =============================================================================
 // CONFIGURATION
@@ -13,7 +20,10 @@ const LAND_BUFFER = 150;
 const CYCLE_DELAY = 1000;              // 1 second between orchestrator cycles
 const MAX_ACTIVITY_LOG = 12;           // Recent activity entries to display
 const INFO_FILE = '/data/orchestrator-info.json';
-const RESERVED_SERVERS = ["nexus"];    // Excluded from worker deployment
+// Reserved servers are now dynamically determined by server-utils.js
+// This includes nexus, nexus-0, and hacknet servers in BN9
+// Keeping this for reference/override if needed
+const RESERVED_SERVERS_OVERRIDE = [];    // Additional servers to exclude from worker deployment
 const BACKDOOR_SCRIPT = "utils/backdoor-sluts.js";
 const BACKDOOR_WARN_COOLDOWN = 300000; // 5 minutes
 
@@ -1506,20 +1516,22 @@ function trySpawnBackdoor(ns) {
 }
 
 /**
- * Get reserved servers that have sufficient RAM
+ * Get reserved servers (uses server-utils.js + any local overrides)
  * @param {NS} ns
  * @returns {string[]}
  */
-function getReservedServers(ns) {
-  const ready = [];
-  for (const name of RESERVED_SERVERS) {
-    if (!ns.serverExists(name)) continue;
-    const server = ns.getServer(name);
-    if (server.maxRam >= getNexusTargetRam(ns)) {
-      ready.push(name);
+function getReservedServersLocal(ns) {
+  // Get reserved servers from server-utils (nexus, hacknet servers in BN9, etc.)
+  const reserved = getReservedServers(ns);
+  
+  // Add any local overrides
+  for (const name of RESERVED_SERVERS_OVERRIDE) {
+    if (ns.serverExists(name) && !reserved.includes(name)) {
+      reserved.push(name);
     }
   }
-  return ready;
+  
+  return reserved;
 }
 
 // =============================================================================
@@ -1548,6 +1560,20 @@ function printStatus(ns, stats, runners) {
     usedRam += ns.getServerUsedRam(runner);
   }
   ns.print(`🖥️  Runners: ${runners.length} | RAM: ${ns.formatRam(usedRam)}/${ns.formatRam(totalRam)}`);
+  
+  // Nexus status (compact)
+  const nexusInfo = getNexusInfo(ns);
+  if (nexusInfo.server) {
+    const nexusIcon = nexusInfo.ready ? "✅" : "⏳";
+    ns.print(`${nexusIcon} Nexus: ${nexusInfo.server} (${ns.formatRam(nexusInfo.ram)})`);
+  }
+  
+  // Hacknet status (if applicable)
+  if (hasHacknetServers(ns)) {
+    const hacknetCount = getHacknetServers(ns).length;
+    ns.print(`🔗 Hacknet Servers: ${hacknetCount} (excluded)`);
+  }
+  
   ns.print(`🎮 Hacking Level: ${ns.getHackingLevel()}`);
   
   // Show sample operation times for a reference server
@@ -1638,7 +1664,27 @@ export async function main(ns) {
   ns.tail();
   
   ns.print("Starting Orchestrator v2...");
-  ns.print(`  Reserved Servers: ${RESERVED_SERVERS.join(", ")}`);
+  
+  // Show nexus info
+  const nexusInfo = getNexusInfo(ns);
+  if (nexusInfo.server) {
+    ns.print(`  Nexus: ${nexusInfo.server} (${ns.formatRam(nexusInfo.ram)}/${ns.formatRam(nexusInfo.targetRam)})`);
+  } else {
+    ns.print(`  Nexus: Not yet designated`);
+  }
+  
+  // Show reserved servers
+  const reserved = getReservedServersLocal(ns);
+  if (reserved.length > 0) {
+    ns.print(`  Reserved: ${reserved.join(", ")}`);
+  }
+  
+  // Show hacknet status
+  if (hasHacknetServers(ns)) {
+    const hacknetServers = getHacknetServers(ns);
+    ns.print(`  Hacknet Servers: ${hacknetServers.length} (excluded from runners)`);
+  }
+  
   ns.print(`  Prep Thread Ratio: ${MAX_PREP_THREAD_RATIO * 100}%`);
   ns.print("");
   
@@ -1660,11 +1706,15 @@ export async function main(ns) {
     // Try backdoor script
     trySpawnBackdoor(ns);
     
-    // Categorize servers (always include home)
-    let { targetServers, runnerServers } = categorizeServers(ns, allServers, true);
+    // Get target servers using categorizeServers (for money targets)
+    let { targetServers } = categorizeServers(ns, allServers, true);
     
-    // Filter out reserved servers
-    const reserved = getReservedServers(ns);
+    // Get runner servers from server-utils (handles hacknet exclusion, reserved servers, etc.)
+    // includeHome=true because we want to use home for workers
+    let runnerServers = getRunnerServers(ns, true);
+    
+    // Filter out any additional local overrides
+    const reserved = getReservedServersLocal(ns);
     runnerServers = runnerServers.filter(s => !reserved.includes(s));
     
     // Deploy worker scripts
