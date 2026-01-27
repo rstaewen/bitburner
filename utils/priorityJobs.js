@@ -123,6 +123,24 @@ const SILHOUETTE_REP_REQUIREMENT = 3_200_000; // 3.2M rep for CTO/CFO/CEO positi
 // Target favor after reset for "good enough" threshold
 const TARGET_FAVOR_AFTER_RESET = 35;
 
+// Priority modifiers for "gating" augs that accelerate future progress
+// Lower modifier = higher priority (multiplied against timeUnits)
+// PC Direct family gives company rep bonuses, should be acquired BEFORE company grinding
+const PRIORITY_MODIFIERS = {
+  "PC Direct-Neural Interface": 0.5,           // Base prereq for the family
+  "PC Direct-Neural Interface NeuroNet Injector": 0.5, // +100% company rep (Fulcrum exclusive)
+  "PC Direct-Neural Interface Optimization Submodule": 0.5, // +75% company rep
+};
+
+/**
+ * Get priority modifier for an aug (lower = higher priority)
+ * @param {string} augName
+ * @returns {number} Modifier to multiply timeUnits by (1 = no change, 0.5 = twice as important)
+ */
+function getPriorityModifier(augName) {
+  return PRIORITY_MODIFIERS[augName] || 1;
+}
+
 /**
  * Calculate favor gained from reputation
  * Formula: favor = log_1.02(1 + rep/25000)
@@ -535,6 +553,26 @@ export function getPriorityJobs(ns, stats, forSleeves = false, excludedJobs = ne
   const allFactions = Object.values(ns.enums.FactionName);
   const joinedFactions = allFactions.filter(f => ns.singularity.getFactionRep(f) > 0);
   
+  // For player (not sleeves), build a set of augs that are already "unlocked"
+  // (we have enough rep to buy them from at least one faction)
+  // This prevents grinding for an aug at faction B when faction A can already sell it
+  const alreadyUnlockedAugs = new Set();
+  
+  if (!forSleeves) {
+    for (const faction of joinedFactions) {
+      const factionRep = ns.singularity.getFactionRep(faction);
+      const factionAugs = ns.singularity.getAugmentationsFromFaction(faction);
+      
+      for (const aug of factionAugs) {
+        if (ownedAugs.includes(aug)) continue;
+        const repReq = ns.singularity.getAugmentationRepReq(aug);
+        if (factionRep >= repReq) {
+          alreadyUnlockedAugs.add(aug);
+        }
+      }
+    }
+  }
+  
   // ========== FACTION JOBS ==========
   // For each joined faction, find the next KEY AUG target and calculate time units
   // Factions without any key augs we need are skipped entirely
@@ -552,11 +590,13 @@ export function getPriorityJobs(ns, stats, forSleeves = false, excludedJobs = ne
     if (purchasableAugs.length === 0) continue;
     
     // ONLY consider key augs - skip factions that don't have any key augs we need
-    const keyAugsFromFaction = purchasableAugs.filter(aug => KEY_AUGS.includes(aug));
+    // Also skip augs that are already unlocked at another faction (for player only)
+    const keyAugsFromFaction = purchasableAugs.filter(aug => 
+      KEY_AUGS.includes(aug) && !alreadyUnlockedAugs.has(aug)
+    );
     
     if (keyAugsFromFaction.length === 0) {
-      // This faction has no key augs we need - skip it entirely
-      // (e.g., Netburners - hacknet augs are not useful for bitnode progression)
+      // This faction has no key augs we need that aren't already unlocked elsewhere
       continue;
     }
     
@@ -599,7 +639,14 @@ export function getPriorityJobs(ns, stats, forSleeves = false, excludedJobs = ne
     // (money script will handle donations)
     const canDonate = factionFavor >= FAVOR_DONATION_THRESHOLD;
     
-    const timeUnits = calculateTimeUnits(factionRep, effectiveTarget, factionFavor);
+    let timeUnits = calculateTimeUnits(factionRep, effectiveTarget, factionFavor);
+    
+    // Priority modifier for certain "gating" augs that accelerate future progress
+    // PC Direct family gives company rep bonuses, so we want them BEFORE company grinding
+    const priorityModifier = getPriorityModifier(nextAug);
+    if (priorityModifier !== 1) {
+      timeUnits *= priorityModifier;
+    }
     
     // Check for Daedalus + Red Pill special case
     const isDaedalusRedPill = faction === "Daedalus" && nextAug === "The Red Pill";

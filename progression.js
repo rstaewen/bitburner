@@ -65,6 +65,7 @@ const GRAFT_PRIORITY = [
   "BitRunners Neurolink",
   "Xanipher",
   "ECorp HVMind Implant",
+  "SPTN-97 Gene Modification"
   
   // === LATE GAME (disabled for now - manually trigger if needed) ===
   // "QLink",                    // $75t - only needed for high-hacking BitNodes
@@ -763,7 +764,7 @@ function hasEarlyGrafts(state) {
 }
 
 function hasMidGameGrafts(state) {
-  const midGrafts = GRAFT_PRIORITY.slice(4, 8);
+  const midGrafts = GRAFT_PRIORITY.slice(4, 9);
   return midGrafts.every(aug => state.graftsCompleted.includes(aug));
 }
 
@@ -882,7 +883,7 @@ function getNextGraft(ns, state) {
     try {
       const price = ns.grafting.getAugmentationGraftPrice(aug);
       
-      if (money < price * 1.5) continue;
+      if (money < price) continue;
       
       const prereqs = ns.singularity.getAugmentationPrereq(aug);
       const hasPrereqs = prereqs.every(p => ownedAugs.includes(p));
@@ -1695,20 +1696,6 @@ async function executeReset(ns, state) {
   
   logs.push(`\nPurchased ${purchasedCount}/${queue.augs.length} augs`);
   
-  let coresBought = 0;
-  while (true) {
-    const coreCost = ns.singularity.getUpgradeHomeCoresCost();
-    const money = ns.getServerMoneyAvailable('home');
-    if (coreCost > money || coreCost === Infinity) break;
-    
-    const success = ns.singularity.upgradeHomeCores();
-    if (!success) break;
-    coresBought++;
-  }
-  if (coresBought > 0) {
-    logs.push(`Purchased ${coresBought} home cores`);
-  }
-  
   let ramUpgrades = 0;
   while (true) {
     const ramCost = ns.singularity.getUpgradeHomeRamCost();
@@ -1754,8 +1741,7 @@ async function executeReset(ns, state) {
     ns.print("added to log file");
   } else {
     //write new log file
-    ns.write(LOG_FILE, `==== BITNODE ${ns.getResetInfo().currentNode} RESET LOG ${Date.now()} ====\n`, 'w');
-    ns.write(LOG_FILE, JSON.stringify(logs, null, 2) + '\n', 'w');
+    ns.write(LOG_FILE, `==== BITNODE ${ns.getResetInfo().currentNode} RESET LOG ${Date.now()} ====\n` + JSON.stringify(logs, null, 2) + '\n', 'w');
     ns.print("wrote new log file");
   }
   //copy back to home
@@ -1765,12 +1751,28 @@ async function executeReset(ns, state) {
   }
 
   await ns.sleep(1000);
+  ns.print(`\n=== RESETTING NOW... 10 ===\n`);
+  await ns.sleep(1000);
+  ns.print(`\n=== RESETTING NOW... 9 ===\n`);
+  await ns.sleep(1000);
+  ns.print(`\n=== RESETTING NOW... 8 ===\n`);
+  await ns.sleep(1000);
+  ns.print(`\n=== RESETTING NOW... 7 ===\n`);
+  await ns.sleep(1000);
+  ns.print(`\n=== RESETTING NOW... 6 ===\n`);
+  await ns.sleep(1000);
+  ns.print(`\n=== RESETTING NOW... 5 ===\n`);
+  await ns.sleep(1000);
+  ns.print(`\n=== RESETTING NOW... 4 ===\n`);
+  await ns.sleep(1000);
   ns.print(`\n=== RESETTING NOW... 3 ===\n`);
   await ns.sleep(1000);
   ns.print(`\n=== RESETTING NOW... 2 ===\n`);
   await ns.sleep(1000);
   ns.print(`\n=== RESETTING NOW... 1 ===\n`);
   await ns.sleep(1000);
+  ns.print(`\n=== RESETTING NOW... 100 (lol) ===\n`);
+  await ns.sleep(100000);
   
   ns.singularity.installAugmentations("start.js");
 }

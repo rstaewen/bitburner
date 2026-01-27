@@ -46,17 +46,23 @@ export async function main(ns) {
     try {
       const numSleeves = ns.sleeve.getNumSleeves();
       
-      // Get full priority list ONCE (no exclusions) to check validity of current jobs
+      // Get full priority list ONCE (no exclusions) - sorted by priority
       const dummyStats = getSleeveStats(ns, 0);
       const allPriorityJobs = getPriorityJobs(ns, dummyStats, true, new Set(), { 
         deprioritizeDonatable: CONFIG.DEPRIORITIZE_DONATABLE_FACTIONS 
       });
-      const validJobNames = new Set(allPriorityJobs.map(j => j.name));
+      
+      // Only the top N jobs (where N = numSleeves) are considered "high priority"
+      // Jobs beyond that shouldn't be worked on when better options exist
+      const topPriorityJobNames = new Set(
+        allPriorityJobs.slice(0, numSleeves).map(j => j.name)
+      );
       
       // Track which jobs are being worked by sleeves that should continue
       const usedJobs = new Set();
       
       // First pass: determine which sleeves should keep their current job
+      // Only keep if it's a TOP PRIORITY job, not just any valid job
       const sleeveNeedsReassignment = [];
       
       for (let i = 0; i < numSleeves; i++) {
@@ -66,8 +72,8 @@ export async function main(ns) {
         
         let needsReassignment = true;
         
-        if (desiredJob === Jobs.REP && currentJobName && validJobNames.has(currentJobName)) {
-          // Current job is still a valid priority - keep it
+        if (desiredJob === Jobs.REP && currentJobName && topPriorityJobNames.has(currentJobName)) {
+          // Current job is still a TOP priority - keep it
           usedJobs.add(currentJobName);
           needsReassignment = false;
         }
@@ -171,12 +177,11 @@ function killSleeveScripts(ns, sleeveNumber) {
 function getDesiredJob(ns, sleeveNumber) {
   const sleeve = ns.sleeve.getSleeve(sleeveNumber);
   const purchasableAugs = ns.sleeve.getSleevePurchasableAugs(sleeveNumber);
-  const avgExp = (sleeve.exp.agility + sleeve.exp.defense + sleeve.exp.dexterity + sleeve.exp.strength) / 4;
-  const playerAvgExp = (ns.getPlayer().exp.agility + ns.getPlayer().exp.defense + ns.getPlayer().exp.dexterity + ns.getPlayer().exp.strength) / 4;
+  const avgExp = (sleeve.exp.agility + sleeve.exp.charisma + sleeve.exp.defense + sleeve.exp.dexterity + sleeve.exp.strength) / 5;
   
   if (purchasableAugs.length > 0 && sleeve.shock === 0) {
     return Jobs.AUG;
-  } else if (avgExp < CONFIG.STAT_FLOOR || playerAvgExp < CONFIG.STAT_FLOOR) {
+  } else if (avgExp < CONFIG.STAT_FLOOR) {
     return Jobs.TRAIN;
   } else {
     return Jobs.REP;
