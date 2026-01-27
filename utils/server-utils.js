@@ -93,11 +93,28 @@ export function getHacknetServers(ns) {
  * @returns {number}
  */
 function getSF4Level(ns) {
-  return ns.getResetInfo().ownedSF[4] || 0;
+  const ownedSF = ns.getResetInfo().ownedSF;
+  
+  // ownedSF is a Map, not a plain object
+  if (ownedSF instanceof Map) {
+    return ownedSF.get(4) ?? 0;
+  }
+  
+  // Fallback for potential future API changes
+  if (ownedSF && typeof ownedSF === 'object') {
+    return ownedSF[4] ?? ownedSF["4"] ?? 0;
+  }
+  
+  return 0;
 }
 
 /**
  * Get the RAM cost multiplier for singularity functions based on SF4 level
+ * Based on actual game mechanics:
+ * - BN4: 1x (no penalty)
+ * - SF4-1: 16x RAM cost
+ * - SF4-2: 4x RAM cost  
+ * - SF4-3: 1x RAM cost (no penalty)
  * @param {NS} ns
  * @returns {number}
  */
@@ -109,12 +126,12 @@ export function getSingularityRamMultiplier(ns) {
   if (currentNode === 4) return 1;
   
   // SF4 levels reduce the RAM cost
+  // These are the actual game multipliers
   switch (sf4Level) {
     case 0: return 16;  // No SF4 = 16x RAM cost
-    case 1: return 16;  // SF4-1 = 16x (same as no SF4 for compat)
+    case 1: return 16;  // SF4-1 = 16x
     case 2: return 4;   // SF4-2 = 4x
-    case 3: return 1;   // SF4-3 = 1x (no penalty)
-    default: return 1;
+    default: return 1;  // SF4-3+ = 1x (no penalty)
   }
 }
 

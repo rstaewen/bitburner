@@ -174,33 +174,40 @@ function areAllServersMaxed(ns) {
 function ensureHacknetManager(ns) {
   if (hacknetManagerSpawned) return true;
   
-  // Check if already running on home or nexus
+  // Check if already running on home
   if (ns.isRunning(CONFIG.HACKNET_MANAGER_SCRIPT, "home")) {
     hacknetManagerSpawned = true;
     return true;
   }
   
+  // Check if running on nexus
   const nexus = getNexusHost(ns, 64);
   if (nexus && ns.isRunning(CONFIG.HACKNET_MANAGER_SCRIPT, nexus)) {
     hacknetManagerSpawned = true;
     return true;
   }
   
-  // Try to spawn on nexus if available, otherwise on home
-  const host = nexus || "home";
-  
-  if (!ns.fileExists(CONFIG.HACKNET_MANAGER_SCRIPT, host)) {
-    ns.print(`[MANAGER] ${CONFIG.HACKNET_MANAGER_SCRIPT} not found on ${host}`);
-    return false;
+  // Try to spawn on home first (where the script files are)
+  if (ns.fileExists(CONFIG.HACKNET_MANAGER_SCRIPT, "home")) {
+    const pid = ns.exec(CONFIG.HACKNET_MANAGER_SCRIPT, "home", 1);
+    if (pid > 0) {
+      ns.print(`[MANAGER] Spawned hacknet-manager.js on home (PID: ${pid})`);
+      hacknetManagerSpawned = true;
+      return true;
+    }
   }
   
-  const pid = ns.exec(CONFIG.HACKNET_MANAGER_SCRIPT, host, 1);
-  if (pid > 0) {
-    ns.print(`[MANAGER] Spawned hacknet-manager.js (PID: ${pid})`);
-    hacknetManagerSpawned = true;
-    return true;
+  // Fallback: try nexus if home didn't work and nexus has the script
+  if (nexus && ns.fileExists(CONFIG.HACKNET_MANAGER_SCRIPT, nexus)) {
+    const pid = ns.exec(CONFIG.HACKNET_MANAGER_SCRIPT, nexus, 1);
+    if (pid > 0) {
+      ns.print(`[MANAGER] Spawned hacknet-manager.js on ${nexus} (PID: ${pid})`);
+      hacknetManagerSpawned = true;
+      return true;
+    }
   }
   
+  ns.print(`[MANAGER] ${CONFIG.HACKNET_MANAGER_SCRIPT} not found on home`);
   return false;
 }
 

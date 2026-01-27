@@ -16,8 +16,13 @@ import {
   getNexusInfo,
   copyScriptsToNexus,
   hasHacknetServers,
-  isHacknetBitNode,
 } from "utils/server-utils.js";
+
+import {
+  isInBitNode,
+  getMultiplier,
+  isCacheValid,
+} from "utils/bitnode-cache.js";
 
 // Configuration
 const CONFIG = {
@@ -154,7 +159,6 @@ function getHashActions(ns) {
   const actions = [];
   const hashes = ns.hacknet.numHashes();
   const capacity = ns.hacknet.hashCapacity();
-  const bitNodeMults = ns.getBitNodeMultipliers();
   
   // Sell for money - only if we're not making money from hacking
   if (shouldSellHashesForMoney(ns)) {
@@ -167,8 +171,9 @@ function getHashActions(ns) {
     });
   }
   
-  // Improve studying - critical in BN9 where hacking XP is gimped
-  if (bitNodeMults.HackExpGain < 0.1) {  // Less than 10% hacking XP
+  // Improve studying - critical in BN9 where hacking XP is gimped (5%)
+  // Use cached bitnode check (0 GB) instead of expensive getBitNodeMultipliers() (4 GB)
+  if (isInBitNode(ns, 9)) {
     actions.push({
       action: "Improve Studying",
       priority: 90,
@@ -197,16 +202,14 @@ function getHashActions(ns) {
     execute: () => ns.hacknet.spendHashes("Increase Maximum Money", targetServer),
   });
   
-  // Reduce min security - only if bitnode has increased min security
-  if (bitNodeMults.ServerMinSecurityLevel > 1) {
-    actions.push({
-      action: "Reduce Minimum Security",
-      priority: 40,
-      cost: CONFIG.HASH_COSTS.REDUCE_MIN_SECURITY,
-      available: hashes >= CONFIG.HASH_COSTS.REDUCE_MIN_SECURITY,
-      execute: () => ns.hacknet.spendHashes("Reduce Minimum Security", targetServer),
-    });
-  }
+  // Reduce min security - always include, harmless if not needed
+  actions.push({
+    action: "Reduce Minimum Security",
+    priority: 40,
+    cost: CONFIG.HASH_COSTS.REDUCE_MIN_SECURITY,
+    available: hashes >= CONFIG.HASH_COSTS.REDUCE_MIN_SECURITY,
+    execute: () => ns.hacknet.spendHashes("Reduce Minimum Security", targetServer),
+  });
   
   // Company favor - great for mid/late game
   // TODO: Connect to priorityJobs to find best company
@@ -448,7 +451,7 @@ function executeUpgrade(ns, upgrade) {
  * @param {NS} ns
  */
 async function handleBN9Nexus(ns) {
-  if (!isHacknetBitNode(ns)) return;
+  if (!isInBitNode(ns, 9)) return;
   
   const numNodes = ns.hacknet.numNodes();
   
@@ -546,7 +549,7 @@ function printStatus(ns) {
   ns.print("");
   
   // BN9 nexus status
-  if (isHacknetBitNode(ns)) {
+  if (isInBitNode(ns, 9)) {
     ns.print("─── BN9 NEXUS STATUS ───");
     if (nexusDesignated) {
       const nexusIndex = parseInt(nexusDesignated.split('-').pop());
