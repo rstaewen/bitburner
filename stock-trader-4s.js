@@ -6,7 +6,9 @@ const CONFIG = {
   cashReserve: 10_000_000,
   allowShorting: false,
   excessCashForShorts: 1_000_000_000,
-  minPurchase: 10_000_000  // Don't buy positions smaller than this
+  minPurchase: 10_000_000,  // Don't buy positions smaller than this
+  weakPositionMinProfit: 0.03,  // 3% min profit for weak positions to cover buy/sell spread
+  strongPositionThreshold: 2  // Priority >= this is considered "strong" (++ or better)
 };
 
 const BUY_BUCKETS = [
@@ -46,7 +48,7 @@ export async function main(ns) {
     const marketState = captureMarketState(ns);
     const { buyPriority, shortPriority } = buildPriorityLists(marketState);
 
-    liquidatePositions(ns, marketState);
+    liquidatePositions(ns, marketState, buyPriority, shortPriority);
 
     executePurchases(ns, buyPriority, marketState);
 
@@ -151,53 +153,78 @@ function buildPriorityLists(marketState) {
   return { buyPriority, shortPriority };
 }
 
-function liquidatePositions(ns, marketState) {
+function liquidatePositions(ns, marketState, buyPriority, shortPriority) {
   let soldAnything = false;
 
+  // Check if strong positions are available (priority >= threshold)
+  const hasStrongBuyPosition = buyPriority.some(
+    e => e.classification.priority >= CONFIG.strongPositionThreshold &&
+         marketState.get(e.symbol).longShares < marketState.get(e.symbol).maxShares
+  );
+  const hasStrongShortPosition = shortPriority.some(
+    e => e.classification.priority >= CONFIG.strongPositionThreshold &&
+         marketState.get(e.symbol).shortShares < marketState.get(e.symbol).maxShares
+  );
+
   for (const stock of marketState.values()) {
-    const longSold = liquidateLong(ns, stock);
-    const shortSold = liquidateShort(ns, stock);
+    const longSold = liquidateLong(ns, stock, hasStrongBuyPosition);
+    const shortSold = liquidateShort(ns, stock, hasStrongShortPosition);
     soldAnything = soldAnything || longSold || shortSold;
   }
 
   return soldAnything;
 }
 
-function liquidateLong(ns, stock) {
+function liquidateLong(ns, stock, hasStrongBuyPosition) {
   if (stock.longShares <= 0) return false;
 
-  // IMMEDIATE EXIT: If forecast flipped to sell bias, dump it now regardless of profit
-  if (stock.classification.bias === "sell") {
+  const saleGain = ns.stock.getSaleGain(stock.symbol, stock.longShares, "Long");
+  const costBasis = stock.longShares * stock.longAvg;
+  const profit = saleGain - costBasis;
+  const profitPercent = profit / costBasis;
+
+  // IMMEDIATE EXIT: If forecast dropped below 0.50, dump it now regardless of profit
+  // This catches both "sell" bias (<0.45) and neutral positions trending down (0.45-0.50)
+  if (stock.forecast < 0.50) {
     const soldShares = ns.stock.sellStock(stock.symbol, stock.longShares);
     if (soldShares > 0) {
-      const saleGain = ns.stock.getSaleGain(stock.symbol, soldShares, "Long");
-      const costBasis = soldShares * stock.longAvg;
-      const profit = saleGain - costBasis;
       ns.print(
-        `EMERGENCY SOLD ${soldShares} ${stock.symbol} - forecast went negative (profit ${ns.nFormat(profit, "$0.00a")})`
+        `EMERGENCY SOLD ${soldShares} ${stock.symbol} - forecast below 0.50 (${stock.forecast.toFixed(3)}, profit ${ns.nFormat(profit, "$0.00a")})`
       );
       return true;
     }
     return false;
   }
 
-  // Normal exit: only sell weak buys or neutrals if profitable
-  const shouldExit =
-    stock.classification.bias === "neutral" || stock.classification.priority <= 1;
-  if (!shouldExit) return false;
+  // For strong positions (++ or better), don't sell - let them ride
+  if (stock.classification.priority >= CONFIG.strongPositionThreshold) {
+    return false;
+  }
 
-  const saleGain = ns.stock.getSaleGain(stock.symbol, stock.longShares, "Long");
-  const costBasis = stock.longShares * stock.longAvg;
-  const profit = saleGain - costBasis;
+  // For weak positions (+ or neutral):
+  // - If strong positions are available to buy, sell as soon as profitable (free up cash)
+  // - If no strong positions available, hold until we recover the spread (~3%)
+  const isWeakPosition = stock.classification.priority <= 1 || stock.classification.bias === "neutral";
+  if (!isWeakPosition) return false;
 
-  if (profit <= CONFIG.commission) {
+  // Determine minimum profit threshold
+  let minProfitThreshold;
+  if (hasStrongBuyPosition) {
+    // Strong positions available - sell weak ones as soon as profitable to free up cash
+    minProfitThreshold = CONFIG.commission;
+  } else {
+    // No strong positions - hold weak ones until we recover the spread
+    minProfitThreshold = Math.max(CONFIG.commission, costBasis * CONFIG.weakPositionMinProfit);
+  }
+
+  if (profit <= minProfitThreshold) {
     return false;
   }
 
   const soldShares = ns.stock.sellStock(stock.symbol, stock.longShares);
   if (soldShares > 0) {
     ns.print(
-      `Sold ${soldShares} ${stock.symbol} @ ${ns.nFormat(saleGain / soldShares, "$0.00a")} (profit ${ns.nFormat(profit, "$0.00a")})`
+      `Sold ${soldShares} ${stock.symbol} @ ${ns.nFormat(saleGain / soldShares, "$0.00a")} (profit ${ns.nFormat(profit, "$0.00a")}, ${(profitPercent * 100).toFixed(1)}%)`
     );
     return true;
   }
@@ -205,41 +232,56 @@ function liquidateLong(ns, stock) {
   return false;
 }
 
-function liquidateShort(ns, stock) {
+function liquidateShort(ns, stock, hasStrongShortPosition) {
   if (stock.shortShares <= 0) return false;
 
-  // IMMEDIATE EXIT: If forecast flipped to buy bias, cover now regardless of profit
-  if (stock.classification.bias === "buy") {
+  const repurchaseCost = ns.stock.getSaleGain(stock.symbol, stock.shortShares, "Short");
+  const entryProceeds = stock.shortShares * stock.shortAvg;
+  const profit = entryProceeds - repurchaseCost;
+  const profitPercent = profit / entryProceeds;
+
+  // IMMEDIATE EXIT: If forecast rose above 0.50, cover now regardless of profit
+  // This catches both "buy" bias (>0.55) and neutral positions trending up (0.50-0.55)
+  if (stock.forecast > 0.50) {
     const covered = ns.stock.sellShort(stock.symbol, stock.shortShares);
     if (covered > 0) {
-      const repurchaseCost = ns.stock.getSaleGain(stock.symbol, covered, "Short");
-      const entryProceeds = covered * stock.shortAvg;
-      const profit = entryProceeds - repurchaseCost;
       ns.print(
-        `EMERGENCY COVERED ${covered} ${stock.symbol} - forecast went positive (profit ${ns.nFormat(profit, "$0.00a")})`
+        `EMERGENCY COVERED ${covered} ${stock.symbol} - forecast above 0.50 (${stock.forecast.toFixed(3)}, profit ${ns.nFormat(profit, "$0.00a")})`
       );
       return true;
     }
     return false;
   }
 
-  // Normal exit: only cover weak shorts or neutrals if profitable
-  const shouldExit =
-    stock.classification.bias === "neutral" || stock.classification.priority <= 1;
-  if (!shouldExit) return false;
+  // For strong positions (-- or better), don't cover - let them ride
+  if (stock.classification.priority >= CONFIG.strongPositionThreshold) {
+    return false;
+  }
 
-  const repurchaseCost = ns.stock.getSaleGain(stock.symbol, stock.shortShares, "Short");
-  const entryProceeds = stock.shortShares * stock.shortAvg;
-  const profit = entryProceeds - repurchaseCost;
+  // For weak positions (- or neutral):
+  // - If strong short positions are available, cover as soon as profitable (free up cash)
+  // - If no strong positions available, hold until we recover the spread (~3%)
+  const isWeakPosition = stock.classification.priority <= 1 || stock.classification.bias === "neutral";
+  if (!isWeakPosition) return false;
 
-  if (profit <= CONFIG.commission) {
+  // Determine minimum profit threshold
+  let minProfitThreshold;
+  if (hasStrongShortPosition) {
+    // Strong positions available - cover weak ones as soon as profitable to free up cash
+    minProfitThreshold = CONFIG.commission;
+  } else {
+    // No strong positions - hold weak ones until we recover the spread
+    minProfitThreshold = Math.max(CONFIG.commission, entryProceeds * CONFIG.weakPositionMinProfit);
+  }
+
+  if (profit <= minProfitThreshold) {
     return false;
   }
 
   const covered = ns.stock.sellShort(stock.symbol, stock.shortShares);
   if (covered > 0) {
     ns.print(
-      `Covered ${covered} ${stock.symbol} @ ${ns.nFormat(repurchaseCost / covered, "$0.00a")} (profit ${ns.nFormat(profit, "$0.00a")})`
+      `Covered ${covered} ${stock.symbol} @ ${ns.nFormat(repurchaseCost / covered, "$0.00a")} (profit ${ns.nFormat(profit, "$0.00a")}, ${(profitPercent * 100).toFixed(1)}%)`
     );
     return true;
   }

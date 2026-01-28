@@ -16,6 +16,7 @@ let nexusDesignatedAt = null;
 
 // Constants
 const NEXUS_DEFAULT_NAME = "nexus";
+const NEXUS_DESIGNATION_FILE = '/data/nexus-designation.json';
 const NEXUS_TARGET_RAM_BASE = 512; // GB - base target before SF4 multipliers
 
 /**
@@ -155,6 +156,38 @@ export function getNexusDefaultName(ns) {
 }
 
 /**
+ * Read the nexus designation from file (single source of truth)
+ * @param {NS} ns
+ * @returns {{server: string|null, designatedAt: number|null}}
+ */
+function readNexusDesignation(ns) {
+  try {
+    if (ns.fileExists(NEXUS_DESIGNATION_FILE, 'home')) {
+      const data = JSON.parse(ns.read(NEXUS_DESIGNATION_FILE));
+      if (data.server && ns.serverExists(data.server)) {
+        return data;
+      }
+    }
+  } catch (e) {
+    // File doesn't exist or is corrupt, return null
+  }
+  return { server: null, designatedAt: null };
+}
+
+/**
+ * Write the nexus designation to file (single source of truth)
+ * @param {NS} ns
+ * @param {string} server
+ */
+function writeNexusDesignation(ns, server) {
+  const data = {
+    server,
+    designatedAt: Date.now()
+  };
+  ns.write(NEXUS_DESIGNATION_FILE, JSON.stringify(data), 'w');
+}
+
+/**
  * Find the best hacknet server to use as nexus in BN9
  * Criteria: Largest RAM with smallest level/cores (least "upgraded" for hash production)
  * @param {NS} ns
@@ -220,13 +253,25 @@ function findPurchasedNexus(ns, minRam = 0) {
 
 /**
  * Get the designated nexus host
- * Caches the result until soft reset
+ * Uses file-based storage for cross-script consistency
  * @param {NS} ns
  * @param {number} minRam - Minimum RAM required (default 0)
  * @returns {string|null}
  */
 export function getNexusHost(ns, minRam = 0) {
-  // Return cached nexus if still valid
+  // First check file-based designation (single source of truth)
+  const fileDesignation = readNexusDesignation(ns);
+  if (fileDesignation.server) {
+    const ram = ns.getServerMaxRam(fileDesignation.server);
+    if (ram >= minRam) {
+      // Update in-memory cache
+      designatedNexus = fileDesignation.server;
+      nexusDesignatedAt = fileDesignation.designatedAt;
+      return designatedNexus;
+    }
+  }
+  
+  // Return cached nexus if still valid (fallback)
   if (designatedNexus && ns.serverExists(designatedNexus)) {
     const ram = ns.getServerMaxRam(designatedNexus);
     if (ram >= minRam) {
@@ -242,6 +287,7 @@ export function getNexusHost(ns, minRam = 0) {
       if (ram >= minRam) {
         designatedNexus = hacknetNexus;
         nexusDesignatedAt = Date.now();
+        writeNexusDesignation(ns, designatedNexus);
         return designatedNexus;
       }
     }
@@ -252,10 +298,27 @@ export function getNexusHost(ns, minRam = 0) {
   if (purchasedNexus) {
     designatedNexus = purchasedNexus;
     nexusDesignatedAt = Date.now();
+    writeNexusDesignation(ns, designatedNexus);
     return designatedNexus;
   }
   
   return null;
+}
+
+/**
+ * Designate a specific server as the nexus (for hacknet-manager to set)
+ * @param {NS} ns
+ * @param {string} server
+ * @returns {boolean} Success
+ */
+export function setNexusHost(ns, server) {
+  if (!ns.serverExists(server)) {
+    return false;
+  }
+  designatedNexus = server;
+  nexusDesignatedAt = Date.now();
+  writeNexusDesignation(ns, server);
+  return true;
 }
 
 /**
