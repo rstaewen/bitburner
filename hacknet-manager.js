@@ -364,9 +364,10 @@ function getHashActions(ns) {
           execute: () => false,  // Don't execute hash spend, need $ upgrade first
         }];
       }
-    } else if (!topAction.available && topAction.cost <= capacity) {
+    } else if (!topAction.available && topAction.cost <= capacity && topAction.priority >= 100) {
       // Top action CAN fit in capacity but we don't have enough hashes yet
-      // Return empty to force accumulation - don't spend on lower priority actions
+      // Only wait for truly high-priority actions (studying at 150, selling at 100)
+      // Don't wait for similar-priority actions like min sec (55) vs max money (50)
       return [{
         action: `⏳ Saving for ${topAction.action}`,
         priority: topAction.priority,
@@ -1130,7 +1131,7 @@ function printStatus(ns) {
     // Convert hash gain to $/sec (1 hash = $250k when sold)
     const hashToMoney = 1e6 / CONFIG.HASH_COSTS.SELL_FOR_MONEY;  // $250k per hash
     const hashIncomeGain = targetHashGain * hashToMoney;
-    const adjustedOutsideIncome = Math.pow(hackingIncome, 0.6);
+    const adjustedOutsideIncome = Math.pow(hackingIncome, 0.7);
     
     // Effective income considers hash value PLUS sqrt(online income)
     // This reflects that hashes support overall operations (max money boosts, etc.)
@@ -1215,7 +1216,7 @@ export async function main(ns) {
       const hashToMoney = 1e6 / CONFIG.HASH_COSTS.SELL_FOR_MONEY;
       const hashIncomeGain = hashGain * hashToMoney;
       const onlineIncome = ns.getTotalScriptIncome()[0];
-      const adjustedOutsideIncome = Math.pow(onlineIncome, 0.6);
+      const adjustedOutsideIncome = Math.pow(onlineIncome, 0.7);
       const effectiveIncomeGain = hashIncomeGain + adjustedOutsideIncome;
       const upgradeCost = (upgrade.nodeIndex === -1 && upgrade.totalCost) ? upgrade.totalCost : upgrade.cost;
       const paybackTime = effectiveIncomeGain > 0 ? upgradeCost / effectiveIncomeGain : Infinity;

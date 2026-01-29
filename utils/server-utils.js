@@ -1,5 +1,7 @@
 /** @param {NS} ns */
 
+import { getAllServers } from '/utils/scanner.js';
+
 /**
  * server-utils.js - Centralized server knowledge and management
  * 
@@ -738,6 +740,213 @@ function writeHacknetBoostTarget(ns, target) {
   ns.write(HACKNET_BOOST_TARGET_FILE, JSON.stringify(data, null, 2), 'w');
 }
 
+// =============================================================================
+// SERVER VALUE AND EFFICIENCY CALCULATIONS
+// =============================================================================
+
+/**
+ * Calculate the "value" of each hackable server
+ * 
+ * Value = 95% of maxMoney / (max(weakenTime, growTime, hackTime) + 0.3)
+ * 
+ * The 0.3s buffer accounts for the orchestrator's layered algorithm which
+ * spaces grow/weaken/hack threads with 150ms between landing times.
+ * This represents the theoretical minimum cycle time for 95% money extraction.
+ * 
+ * @param {NS} ns
+ * @returns {Map<string, {server: string, maxMoney: number, cycleTime: number, value: number, reqLevel: number}>}
+ */
+export function getServerValues(ns) {
+  const allServers = getAllServers(ns);
+  const player = ns.getPlayer();
+  const results = new Map();
+  
+  for (const server of allServers) {
+    const maxMoney = ns.getServerMaxMoney(server);
+    
+    // Skip servers with no money (purchased servers, special servers, etc.)
+    if (maxMoney <= 0) continue;
+    
+    // Skip n00dles - too low max money, not worth boosting
+    if (server === "n00dles") continue;
+    
+    const reqLevel = ns.getServerRequiredHackingLevel(server);
+    
+    // Get timing info - use server at min security for accurate timing
+    const serverObj = ns.getServer(server);
+    serverObj.hackDifficulty = serverObj.minDifficulty; // Simulate prepped state
+    
+    const hackTime = ns.formulas.hacking.hackTime(serverObj, player);
+    const growTime = ns.formulas.hacking.growTime(serverObj, player);
+    const weakenTime = ns.formulas.hacking.weakenTime(serverObj, player);
+    
+    // Cycle time = max of all times + 0.3s buffer for thread layering
+    const cycleTimeMs = Math.max(hackTime, growTime, weakenTime) + 300;
+    const cycleTimeSec = cycleTimeMs / 1000;
+    
+    // Value = 95% of max money per cycle time
+    const value = (maxMoney * 0.95) / cycleTimeSec;
+    
+    results.set(server, {
+      server,
+      maxMoney,
+      cycleTime: cycleTimeSec,
+      value,
+      reqLevel
+    });
+  }
+  
+  return results;
+}
+
+/**
+ * Calculate the "efficiency" of each hackable server (value per thread)
+ * 
+ * Efficiency = value / weighted_average_threads
+ * 
+ * Where weighted_average_threads accounts for:
+ * - Hack threads + weaken threads to go from 100% to 5% money and restore security
+ * - Grow threads + weaken threads to go from 5% to 100% money and restore security
+ * - Weighted by hack time vs grow time (longer operations need more sustained threads)
+ * 
+ * This metric is ideal for RAM-constrained scenarios where we want max $/sec/thread.
+ * 
+ * @param {NS} ns
+ * @returns {Map<string, {server: string, value: number, efficiency: number, hackThreads: number, growThreads: number, weakenThreads: number, reqLevel: number}>}
+ */
+export function getServerEfficiencies(ns) {
+  const serverValues = getServerValues(ns);
+  const player = ns.getPlayer();
+  const results = new Map();
+  
+  // Constants for thread calculation
+  const HACK_SECURITY_INCREASE = 0.002;  // Per thread
+  const GROW_SECURITY_INCREASE = 0.004;  // Per thread
+  const WEAKEN_SECURITY_DECREASE = 0.05; // Per thread
+  
+  for (const [server, data] of serverValues) {
+    const serverObj = ns.getServer(server);
+    serverObj.hackDifficulty = serverObj.minDifficulty; // Prepped state
+    serverObj.moneyAvailable = serverObj.moneyMax;      // Full money
+    
+    // Calculate hack percent per thread
+    const hackPercent = ns.formulas.hacking.hackPercent(serverObj, player);
+    
+    // Threads to hack from 100% to 5% (take 95%)
+    const hackThreads = Math.ceil(0.95 / Math.max(hackPercent, 0.0001));
+    
+    // Security increase from hacking
+    const hackSecurityIncrease = hackThreads * HACK_SECURITY_INCREASE;
+    const weakenThreadsForHack = Math.ceil(hackSecurityIncrease / WEAKEN_SECURITY_DECREASE);
+    
+    // Calculate grow threads to go from 5% to 100% (need 20x multiplier)
+    // Using formulas to get accurate thread count
+    serverObj.moneyAvailable = serverObj.moneyMax * 0.05; // Simulate post-hack state
+    const growThreads = Math.ceil(ns.formulas.hacking.growThreads(serverObj, player, serverObj.moneyMax));
+    
+    // Security increase from growing
+    const growSecurityIncrease = growThreads * GROW_SECURITY_INCREASE;
+    const weakenThreadsForGrow = Math.ceil(growSecurityIncrease / WEAKEN_SECURITY_DECREASE);
+    
+    // Total threads for each phase
+    const hackPhaseThreads = hackThreads + weakenThreadsForHack;
+    const growPhaseThreads = growThreads + weakenThreadsForGrow;
+    
+    // Get timing for weighting
+    serverObj.hackDifficulty = serverObj.minDifficulty;
+    serverObj.moneyAvailable = serverObj.moneyMax;
+    const hackTime = ns.formulas.hacking.hackTime(serverObj, player);
+    const growTime = ns.formulas.hacking.growTime(serverObj, player);
+    
+    // Weight by time (longer operations tie up threads longer)
+    const totalTime = hackTime + growTime;
+    const hackWeight = hackTime / totalTime;
+    const growWeight = growTime / totalTime;
+    
+    // Weighted average threads
+    const weightedThreads = (hackPhaseThreads * hackWeight) + (growPhaseThreads * growWeight);
+    
+    // Efficiency = value per thread
+    const efficiency = data.value / Math.max(weightedThreads, 1);
+    
+    results.set(server, {
+      server,
+      value: data.value,
+      efficiency,
+      hackThreads,
+      growThreads,
+      weakenThreadsForHack,
+      weakenThreadsForGrow,
+      totalThreads: hackPhaseThreads + growPhaseThreads,
+      reqLevel: data.reqLevel
+    });
+  }
+  
+  return results;
+}
+
+/**
+ * Calculate the XP efficiency of each hackable server (XP per thread per second)
+ * 
+ * In Bitburner, hack/grow/weaken all give the same XP per thread based on server difficulty.
+ * XP = baseDifficulty * hackExpMult * bitnodeMults (via ns.formulas.hacking.hackExp)
+ * 
+ * XP Efficiency = hackExp / cycleTime
+ * 
+ * This gives XP per thread per second, useful for optimizing hacking XP gain.
+ * Higher difficulty servers give more XP but also take longer - this metric
+ * finds the optimal balance.
+ * 
+ * @param {NS} ns
+ * @returns {Map<string, {server: string, xpPerThread: number, cycleTime: number, xpEfficiency: number, reqLevel: number}>}
+ */
+export function getServerXPEfficiencies(ns) {
+  const allServers = getAllServers(ns);
+  const player = ns.getPlayer();
+  const results = new Map();
+  
+  for (const server of allServers) {
+    const maxMoney = ns.getServerMaxMoney(server);
+    
+    // Skip servers with no money (purchased servers, special servers, etc.)
+    if (maxMoney <= 0) continue;
+    
+    const reqLevel = ns.getServerRequiredHackingLevel(server);
+    
+    // Get server at min security for accurate calculations
+    const serverObj = ns.getServer(server);
+    serverObj.hackDifficulty = serverObj.minDifficulty; // Simulate prepped state
+    
+    // XP per thread (same for hack, grow, weaken)
+    const xpPerThread = ns.formulas.hacking.hackExp(serverObj, player);
+    
+    // Get timing info
+    const hackTime = ns.formulas.hacking.hackTime(serverObj, player);
+    const growTime = ns.formulas.hacking.growTime(serverObj, player);
+    const weakenTime = ns.formulas.hacking.weakenTime(serverObj, player);
+    
+    // Cycle time = max of all times + 0.3s buffer for thread layering
+    const cycleTimeMs = Math.max(hackTime, growTime, weakenTime) + 300;
+    const cycleTimeSec = cycleTimeMs / 1000;
+    
+    // XP efficiency = XP per thread per second
+    // Since all operations give the same XP, this is simply xpPerThread / cycleTime
+    const xpEfficiency = xpPerThread / cycleTimeSec;
+    
+    results.set(server, {
+      server,
+      xpPerThread,
+      cycleTime: cycleTimeSec,
+      xpEfficiency,
+      reqLevel,
+      baseDifficulty: serverObj.baseDifficulty,
+      minDifficulty: serverObj.minDifficulty
+    });
+  }
+  
+  return results;
+}
+
 /**
  * Estimate the max hacking level achievable in this reset
  * 
@@ -858,58 +1067,31 @@ export function getBestHacknetBoostTarget(ns) {
   // Need to select a new target
   const estimatedMaxLevel = estimateMaxHackingLevel(ns);
   
-  // Candidate servers, ordered by preference (high max money, good efficiency)
-  // These are the best targets at various level ranges from server-analysis.txt
-  const candidates = [
-    // Endgame ($10T+ potential)
-    { server: "ecorp", reqLevel: ns.getServerRequiredHackingLevel("ecorp"), priority: 1 },
-    { server: "megacorp", reqLevel: ns.getServerRequiredHackingLevel("megacorp"), priority: 2 },
-    { server: "4sigma", reqLevel: ns.getServerRequiredHackingLevel("4sigma"), priority: 3 },
-    { server: "b-and-a", reqLevel: ns.getServerRequiredHackingLevel("b-and-a"), priority: 4 },
-    { server: "kuai-gong", reqLevel: ns.getServerRequiredHackingLevel("kuai-gong"), priority: 5 },
-    { server: "nwo", reqLevel: ns.getServerRequiredHackingLevel("nwo"), priority: 6 },
-    { server: "clarkinc", reqLevel: ns.getServerRequiredHackingLevel("clarkinc"), priority: 7 },
-    { server: "blade", reqLevel: ns.getServerRequiredHackingLevel("blade"), priority: 8 },
-    { server: "omnitek", reqLevel: ns.getServerRequiredHackingLevel("omnitek"), priority: 9 },
-    
-    // Late game
-    { server: "alpha-ent", reqLevel: ns.getServerRequiredHackingLevel("alpha-ent"), priority: 10 },
-    { server: "rho-construction", reqLevel: ns.getServerRequiredHackingLevel("rho-construction"), priority: 11 },
-    { server: "global-pharm", reqLevel: ns.getServerRequiredHackingLevel("global-pharm"), priority: 12 },
-    { server: "zb-institute", reqLevel: ns.getServerRequiredHackingLevel("zb-institute"), priority: 13 },
-    
-    // Mid game
-    { server: "the-hub", reqLevel: ns.getServerRequiredHackingLevel("the-hub"), priority: 14 },
-    { server: "catalyst", reqLevel: ns.getServerRequiredHackingLevel("catalyst"), priority: 15 },
-    { server: "computek", reqLevel: ns.getServerRequiredHackingLevel("computek"), priority: 16 },
-    { server: "omega-net", reqLevel: ns.getServerRequiredHackingLevel("omega-net"), priority: 17 },
-    
-    // Early-mid (fallback - these have lower max money but are reachable)
-    { server: "phantasy", reqLevel: ns.getServerRequiredHackingLevel("phantasy"), priority: 18 },
-    { server: "silver-helix", reqLevel: ns.getServerRequiredHackingLevel("silver-helix"), priority: 19 },
-    { server: "max-hardware", reqLevel: ns.getServerRequiredHackingLevel("max-hardware"), priority: 20 },
-    { server: "joesguns", reqLevel: ns.getServerRequiredHackingLevel("joesguns"), priority: 21 },
-    // n00dles explicitly excluded - too low max money
-  ];
+  // Get all server values dynamically (accounts for randomized stats each reset)
+  const serverValues = getServerValues(ns);
   
-  // Find the best reachable candidate
-  // We want the highest priority (lowest number) that we can reach
-  for (const candidate of candidates) {
-    if (candidate.reqLevel <= estimatedMaxLevel) {
-      cachedHacknetBoostTarget = candidate.server;
-      cachedHacknetBoostTargetResetTime = resetInfo.lastAugReset;
-      writeHacknetBoostTarget(ns, cachedHacknetBoostTarget);
-      ns.print(`[SERVER-UTILS] Selected hacknet boost target: ${cachedHacknetBoostTarget} (req level ${candidate.reqLevel}, est max ${estimatedMaxLevel})`);
-      return cachedHacknetBoostTarget;
-    }
+  // Filter to reachable servers and sort by value (highest first)
+  const reachableServers = Array.from(serverValues.values())
+    .filter(s => s.reqLevel <= estimatedMaxLevel)
+    .sort((a, b) => b.value - a.value);
+  
+  if (reachableServers.length > 0) {
+    const best = reachableServers[0];
+    cachedHacknetBoostTarget = best.server;
+    cachedHacknetBoostTargetResetTime = resetInfo.lastAugReset;
+    writeHacknetBoostTarget(ns, cachedHacknetBoostTarget);
+    ns.print(`[SERVER-UTILS] Selected hacknet boost target: ${cachedHacknetBoostTarget}`);
+    ns.print(`  → Value: $${ns.formatNumber(best.value)}/s, MaxMoney: $${ns.formatNumber(best.maxMoney)}, ReqLevel: ${best.reqLevel}`);
+    ns.print(`  → Est max level: ${estimatedMaxLevel}, Cycle time: ${best.cycleTime.toFixed(1)}s`);
+    return cachedHacknetBoostTarget;
   }
   
   // Fallback to joesguns if somehow nothing else matched
-  // This should never happen but provides a safe default
+  // This should only happen very early in a reset
   cachedHacknetBoostTarget = "joesguns";
   cachedHacknetBoostTargetResetTime = resetInfo.lastAugReset;
   writeHacknetBoostTarget(ns, cachedHacknetBoostTarget);
-  ns.print(`[SERVER-UTILS] Fallback hacknet boost target: joesguns`);
+  ns.print(`[SERVER-UTILS] Fallback hacknet boost target: joesguns (no reachable servers found)`);
   return cachedHacknetBoostTarget;
 }
 
@@ -929,17 +1111,28 @@ export function clearHacknetBoostTargetCache(ns) {
 /**
  * Get info about the current hacknet boost target selection
  * @param {NS} ns
- * @returns {{target: string, estimatedMaxLevel: number, targetReqLevel: number}}
+ * @returns {{target: string, estimatedMaxLevel: number, targetReqLevel: number, value: number}}
  */
 export function getHacknetBoostTargetInfo(ns) {
   const target = getBestHacknetBoostTarget(ns);
   const estimatedMaxLevel = estimateMaxHackingLevel(ns);
-  const targetReqLevel = SERVER_REQUIRED_LEVELS[target] || 0;
+  const targetReqLevel = target ? ns.getServerRequiredHackingLevel(target) : 0;
+  
+  // Get value info if target exists
+  let value = 0;
+  if (target) {
+    const serverValues = getServerValues(ns);
+    const targetData = serverValues.get(target);
+    if (targetData) {
+      value = targetData.value;
+    }
+  }
   
   return {
     target,
     estimatedMaxLevel,
     targetReqLevel,
+    value,
     reachable: targetReqLevel <= estimatedMaxLevel
   };
 }
