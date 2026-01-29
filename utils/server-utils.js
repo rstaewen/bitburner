@@ -526,3 +526,420 @@ export function execOnNexus(ns, scriptName, threads = 1, ...args) {
   
   return ns.exec(scriptName, nexus, threads, ...args);
 }
+
+// =============================================================================
+// SERVER TARGETING DATA (Single source of truth)
+// =============================================================================
+
+// Blacklisted servers - never hack these, they're not worth the thread cost
+// Generated from server-analyzer.js: servers with growthRate <= 10
+const BLACKLIST_SERVERS = [
+  "fulcrumassets",  // growth=1, needs 67k threads to grow, earns $368/s - absolute worst
+  "foodnstuff",     // growth=5, needs 3.9k threads, deceptively bad early game trap
+  "sigma-cosmetics", // growth=10, needs 1.9k threads
+  // NOTE: n00dles is NOT blacklisted despite low max money ($1.75m)
+  // Its growth rate of 3000 means only ~7 threads to fully grow
+  // Perfect bootstrapper: minimal thread cost, instant cycling, good early XP
+];
+
+// Priority prep targets by hacking level tier
+// From server-analyzer.js output - best $/sec servers at each level range
+const PRIORITY_PREP_TARGETS_BY_LEVEL = {
+  // Level 1-100: Very early game - n00dles is the ultimate bootstrapper
+  // Only needs ~10 threads total to cycle, generates seed money while real targets prep
+  0: ["n00dles", "joesguns", "harakiri-sushi", "hong-fang-tea", "nectar-net", "neo-net"],
+  
+  // Level 101-300: Early game - n00dles still useful but diminishing returns
+  100: ["n00dles", "max-hardware", "joesguns", "harakiri-sushi", "zer0", "phantasy", "nectar-net"],
+  
+  // Level 301-500: Early-mid game - n00dles becomes irrelevant, drop from list
+  300: ["omega-net", "phantasy", "silver-helix", "crush-fitness", "max-hardware", "iron-gym"],
+  
+  // Level 501-700: Mid game
+  500: ["computek", "the-hub", "catalyst", "summit-uni", "rho-construction", "omega-net"],
+  
+  // Level 701-900: Mid-late game
+  700: ["rho-construction", "alpha-ent", "computek", "the-hub", "catalyst", "lexo-corp"],
+  
+  // Level 901-1100: Late game
+  900: ["alpha-ent", "rho-construction", "lexo-corp", "global-pharm", "zb-institute", "computek"],
+  
+  // Level 1101-1300: End game begins
+  1100: ["kuai-gong", "b-and-a", "4sigma", "blade", "nwo", "clarkinc", "megacorp", "omnitek"],
+  
+  // Level 1301-1500: End game
+  1300: ["ecorp", "megacorp", "nwo", "blade", "clarkinc", "b-and-a", "4sigma", "kuai-gong"],
+  
+  // Level 1501+: Max level
+  1500: ["ecorp", "megacorp", "nwo", "clarkinc", "blade", "b-and-a", "4sigma", "kuai-gong", "omnitek"],
+};
+
+// Server required hacking levels (for hacknet boost target selection)
+// These are the minimum hacking levels needed to hack each server
+const SERVER_REQUIRED_LEVELS = {
+  "n00dles": 1,
+  "foodnstuff": 1,
+  "sigma-cosmetics": 5,
+  "joesguns": 10,
+  "nectar-net": 20,
+  "hong-fang-tea": 30,
+  "harakiri-sushi": 40,
+  "neo-net": 50,
+  "zer0": 75,
+  "max-hardware": 80,
+  "iron-gym": 100,
+  "phantasy": 100,
+  "silver-helix": 150,
+  "omega-net": 187,
+  "crush-fitness": 225,
+  "johnson-ortho": 250,
+  "the-hub": 275,
+  "computek": 300,
+  "netlink": 375,
+  "catalyst": 400,
+  "summit-uni": 400,
+  "syscore": 450,
+  "rothman-uni": 475,
+  "aevum-police": 500,
+  "millenium-fitness": 525,
+  "lexo-corp": 550,
+  "alpha-ent": 600,
+  "rho-construction": 650,
+  "snap-fitness": 700,
+  "zb-institute": 725,
+  "global-pharm": 750,
+  "unitalife": 775,
+  "zb-def": 775,
+  "nova-med": 800,
+  "deltaone": 800,
+  "applied-energetics": 850,
+  "zeus-med": 850,
+  "univ-energy": 875,
+  "solaris": 900,
+  "taiyang-digital": 925,
+  "aerocorp": 925,
+  "titan-labs": 950,
+  "galactic-cyber": 950,
+  "vitalife": 975,
+  "omnia": 975,
+  "icarus": 1000,
+  "defcomm": 1000,
+  "helios": 1000,
+  "microdyne": 1000,
+  "stormtech": 1025,
+  "infocomm": 1050,
+  "fulcrumtech": 1050,
+  "powerhouse-fitness": 1075,
+  "omnitek": 1100,
+  "b-and-a": 1100,
+  "blade": 1150,
+  "nwo": 1200,
+  "clarkinc": 1200,
+  "4sigma": 1200,
+  "kuai-gong": 1250,
+  "fulcrumassets": 1250,
+  "megacorp": 1300,
+  "ecorp": 1350,
+};
+
+// Cache for hacknet boost target (stable for entire reset)
+let cachedHacknetBoostTarget = null;
+let cachedHacknetBoostTargetResetTime = 0;  // Track which reset the cache is for
+const HACKNET_BOOST_TARGET_FILE = '/data/hacknet-boost-target.json';
+
+/**
+ * Get the blacklisted servers array
+ * @returns {string[]}
+ */
+export function getBlacklistServers() {
+  return [...BLACKLIST_SERVERS];
+}
+
+/**
+ * Check if a server is blacklisted
+ * @param {string} server
+ * @returns {boolean}
+ */
+export function isServerBlacklisted(server) {
+  return BLACKLIST_SERVERS.includes(server);
+}
+
+/**
+ * Get priority prep targets for the current hacking level
+ * @param {NS} ns
+ * @returns {string[]}
+ */
+export function getPriorityTargets(ns) {
+  const hackLevel = ns.getHackingLevel();
+  
+  // Find the appropriate tier
+  const levelTiers = Object.keys(PRIORITY_PREP_TARGETS_BY_LEVEL)
+    .map(Number)
+    .sort((a, b) => b - a); // Sort descending
+  
+  for (const tier of levelTiers) {
+    if (hackLevel >= tier) {
+      return [...PRIORITY_PREP_TARGETS_BY_LEVEL[tier]];
+    }
+  }
+  
+  return [...PRIORITY_PREP_TARGETS_BY_LEVEL[0]];
+}
+
+/**
+ * Get the full priority prep targets table
+ * @returns {Object}
+ */
+export function getPriorityTargetsByLevel() {
+  // Return a copy to prevent mutation
+  return JSON.parse(JSON.stringify(PRIORITY_PREP_TARGETS_BY_LEVEL));
+}
+
+// =============================================================================
+// HACKNET BOOST TARGET SELECTION
+// =============================================================================
+
+/**
+ * Read the cached hacknet boost target from file
+ * @param {NS} ns
+ * @returns {string|null}
+ */
+function readHacknetBoostTarget(ns) {
+  try {
+    if (ns.fileExists(HACKNET_BOOST_TARGET_FILE, 'home')) {
+      const data = JSON.parse(ns.read(HACKNET_BOOST_TARGET_FILE));
+      if (data.target && typeof data.target === 'string') {
+        // Validate that this cache was created in the current reset
+        const resetTime = ns.getResetInfo().lastAugReset;
+        if (data.selectedAt && data.selectedAt > resetTime) {
+          return data.target;
+        }
+        // Stale cache from previous reset - will be cleared by caller
+        return null;
+      }
+    }
+  } catch (e) {
+    // File doesn't exist or is corrupt
+  }
+  return null;
+}
+
+/**
+ * Write the hacknet boost target to file (persists across script restarts)
+ * @param {NS} ns
+ * @param {string} target
+ */
+function writeHacknetBoostTarget(ns, target) {
+  const data = {
+    target,
+    selectedAt: Date.now(),
+    reason: `Selected based on expected reachable max money potential`
+  };
+  ns.write(HACKNET_BOOST_TARGET_FILE, JSON.stringify(data, null, 2), 'w');
+}
+
+/**
+ * Estimate the max hacking level achievable in this reset
+ * 
+ * CONSERVATIVE approach: It's much better to pick a lower-tier reachable server
+ * than to pick a high-tier server we can't reach. Unreachable servers waste
+ * all the hashes spent on max money/min security boosts.
+ * 
+ * Strategy:
+ * - Project to hour 4 (short horizon = more reliable)
+ * - Use pessimistic decay factor (XP requirements grow exponentially)
+ * - If we're past hour 4, just use current level (we have real data)
+ * 
+ * @param {NS} ns
+ * @returns {number}
+ */
+function estimateMaxHackingLevel(ns) {
+  const player = ns.getPlayer();
+  const currentLevel = player.skills.hacking;
+  
+  // Short projection horizon - only project to hour 4
+  // This gives us a reliable estimate without wild speculation
+  const PROJECTION_HORIZON_HOURS = 4;
+  
+  // Conservative decay - XP requirements grow exponentially
+  // At higher levels, each level takes significantly more XP
+  const DECAY_FACTOR = 0.15;  // Very conservative
+  
+  // Calculate time since last aug reset
+  const resetInfo = ns.getResetInfo();
+  const lastAugReset = resetInfo.lastAugReset;
+  const hoursElapsed = (Date.now() - lastAugReset) / (1000 * 60 * 60);
+  
+  // If we're past the projection horizon, just use current level
+  // We have real data - no need to speculate
+  if (hoursElapsed >= PROJECTION_HORIZON_HOURS) {
+    return currentLevel;
+  }
+  
+  // Avoid division by zero in very early game (< 1 minute)
+  if (hoursElapsed < 0.017) {  // ~1 minute
+    return currentLevel;
+  }
+  
+  // Calculate current leveling rate
+  const currentRate = currentLevel / hoursElapsed;  // levels per hour
+  
+  // Project to hour 4 only (short, reliable horizon)
+  const remainingHours = PROJECTION_HORIZON_HOURS - hoursElapsed;
+  const projectedGain = currentRate * remainingHours * DECAY_FACTOR;
+  const estimatedMax = Math.floor(currentLevel + projectedGain);
+  
+  // Never estimate lower than current level
+  return Math.max(currentLevel, estimatedMax);
+}
+
+/**
+ * Select the best server for hacknet max money and min security boosts
+ * 
+ * Criteria:
+ * - Must NOT be n00dles (too low max money, soft cap makes it worthless)
+ * - Must be reachable (required hacking level <= estimated max level)
+ * - Should have high max money potential
+ * - Should be from priority targets (known good servers)
+ * - Stable for entire reset (won't change mid-run)
+ * 
+ * The max money upgrade is percentage-based (2% per hash) but hits a severe
+ * soft cap at $10T where returns drop to 0.04%. We want a server that:
+ * 1. Has high enough base max money to be worth boosting
+ * 2. Is reachable within the reset
+ * 
+ * @param {NS} ns
+ * @returns {string}
+ */
+export function getBestHacknetBoostTarget(ns) {
+  // Minimum time before we commit to a cached target
+  // Allows leveling rate to stabilize (e.g., after starting studying loop)
+  const MIN_HOURS_BEFORE_CACHE = 1;
+  
+  // ALWAYS check elapsed time FIRST - this is the gate for early reset
+  const resetInfo = ns.getResetInfo();
+  const hoursElapsed = (Date.now() - resetInfo.lastAugReset) / (1000 * 60 * 60);
+  
+  if (hoursElapsed < MIN_HOURS_BEFORE_CACHE) {
+    // Too early - return null to signal "not ready yet"
+    // Callers should skip boost actions when target is null
+    // Clear any stale caches (memory and file)
+    if (cachedHacknetBoostTarget) {
+      cachedHacknetBoostTarget = null;
+      cachedHacknetBoostTargetResetTime = 0;
+    }
+    if (ns.fileExists(HACKNET_BOOST_TARGET_FILE, 'home')) {
+      ns.rm(HACKNET_BOOST_TARGET_FILE, 'home');
+      ns.print(`[SERVER-UTILS] Cleared stale hacknet target cache from previous reset`);
+    }
+    ns.print(`[SERVER-UTILS] Too early to select hacknet target (${hoursElapsed.toFixed(2)}h < ${MIN_HOURS_BEFORE_CACHE}h)`);
+    return null;
+  }
+  
+  // Check memory cache - but validate it's from current reset
+  if (cachedHacknetBoostTarget && cachedHacknetBoostTargetResetTime === resetInfo.lastAugReset) {
+    return cachedHacknetBoostTarget;
+  }
+  
+  // Memory cache invalid or missing - check file cache
+  // File cache validates reset time internally via selectedAt timestamp
+  const fileTarget = readHacknetBoostTarget(ns);
+  if (fileTarget) {
+    cachedHacknetBoostTarget = fileTarget;
+    cachedHacknetBoostTargetResetTime = resetInfo.lastAugReset;
+    return cachedHacknetBoostTarget;
+  }
+  
+  // Clear stale file cache if it exists but wasn't valid
+  if (ns.fileExists(HACKNET_BOOST_TARGET_FILE, 'home')) {
+    ns.rm(HACKNET_BOOST_TARGET_FILE, 'home');
+  }
+  
+  // Need to select a new target
+  const estimatedMaxLevel = estimateMaxHackingLevel(ns);
+  
+  // Candidate servers, ordered by preference (high max money, good efficiency)
+  // These are the best targets at various level ranges from server-analysis.txt
+  const candidates = [
+    // Endgame ($10T+ potential)
+    { server: "ecorp", reqLevel: ns.getServerRequiredHackingLevel("ecorp"), priority: 1 },
+    { server: "megacorp", reqLevel: ns.getServerRequiredHackingLevel("megacorp"), priority: 2 },
+    { server: "4sigma", reqLevel: ns.getServerRequiredHackingLevel("4sigma"), priority: 3 },
+    { server: "b-and-a", reqLevel: ns.getServerRequiredHackingLevel("b-and-a"), priority: 4 },
+    { server: "kuai-gong", reqLevel: ns.getServerRequiredHackingLevel("kuai-gong"), priority: 5 },
+    { server: "nwo", reqLevel: ns.getServerRequiredHackingLevel("nwo"), priority: 6 },
+    { server: "clarkinc", reqLevel: ns.getServerRequiredHackingLevel("clarkinc"), priority: 7 },
+    { server: "blade", reqLevel: ns.getServerRequiredHackingLevel("blade"), priority: 8 },
+    { server: "omnitek", reqLevel: ns.getServerRequiredHackingLevel("omnitek"), priority: 9 },
+    
+    // Late game
+    { server: "alpha-ent", reqLevel: ns.getServerRequiredHackingLevel("alpha-ent"), priority: 10 },
+    { server: "rho-construction", reqLevel: ns.getServerRequiredHackingLevel("rho-construction"), priority: 11 },
+    { server: "global-pharm", reqLevel: ns.getServerRequiredHackingLevel("global-pharm"), priority: 12 },
+    { server: "zb-institute", reqLevel: ns.getServerRequiredHackingLevel("zb-institute"), priority: 13 },
+    
+    // Mid game
+    { server: "the-hub", reqLevel: ns.getServerRequiredHackingLevel("the-hub"), priority: 14 },
+    { server: "catalyst", reqLevel: ns.getServerRequiredHackingLevel("catalyst"), priority: 15 },
+    { server: "computek", reqLevel: ns.getServerRequiredHackingLevel("computek"), priority: 16 },
+    { server: "omega-net", reqLevel: ns.getServerRequiredHackingLevel("omega-net"), priority: 17 },
+    
+    // Early-mid (fallback - these have lower max money but are reachable)
+    { server: "phantasy", reqLevel: ns.getServerRequiredHackingLevel("phantasy"), priority: 18 },
+    { server: "silver-helix", reqLevel: ns.getServerRequiredHackingLevel("silver-helix"), priority: 19 },
+    { server: "max-hardware", reqLevel: ns.getServerRequiredHackingLevel("max-hardware"), priority: 20 },
+    { server: "joesguns", reqLevel: ns.getServerRequiredHackingLevel("joesguns"), priority: 21 },
+    // n00dles explicitly excluded - too low max money
+  ];
+  
+  // Find the best reachable candidate
+  // We want the highest priority (lowest number) that we can reach
+  for (const candidate of candidates) {
+    if (candidate.reqLevel <= estimatedMaxLevel) {
+      cachedHacknetBoostTarget = candidate.server;
+      cachedHacknetBoostTargetResetTime = resetInfo.lastAugReset;
+      writeHacknetBoostTarget(ns, cachedHacknetBoostTarget);
+      ns.print(`[SERVER-UTILS] Selected hacknet boost target: ${cachedHacknetBoostTarget} (req level ${candidate.reqLevel}, est max ${estimatedMaxLevel})`);
+      return cachedHacknetBoostTarget;
+    }
+  }
+  
+  // Fallback to joesguns if somehow nothing else matched
+  // This should never happen but provides a safe default
+  cachedHacknetBoostTarget = "joesguns";
+  cachedHacknetBoostTargetResetTime = resetInfo.lastAugReset;
+  writeHacknetBoostTarget(ns, cachedHacknetBoostTarget);
+  ns.print(`[SERVER-UTILS] Fallback hacknet boost target: joesguns`);
+  return cachedHacknetBoostTarget;
+}
+
+/**
+ * Clear the hacknet boost target cache (for testing or after augmentation)
+ * Call this after installing augmentations to re-evaluate the target
+ * @param {NS} ns
+ */
+export function clearHacknetBoostTargetCache(ns) {
+  cachedHacknetBoostTarget = null;
+  cachedHacknetBoostTargetResetTime = 0;
+  if (ns.fileExists(HACKNET_BOOST_TARGET_FILE, 'home')) {
+    ns.rm(HACKNET_BOOST_TARGET_FILE, 'home');
+  }
+}
+
+/**
+ * Get info about the current hacknet boost target selection
+ * @param {NS} ns
+ * @returns {{target: string, estimatedMaxLevel: number, targetReqLevel: number}}
+ */
+export function getHacknetBoostTargetInfo(ns) {
+  const target = getBestHacknetBoostTarget(ns);
+  const estimatedMaxLevel = estimateMaxHackingLevel(ns);
+  const targetReqLevel = SERVER_REQUIRED_LEVELS[target] || 0;
+  
+  return {
+    target,
+    estimatedMaxLevel,
+    targetReqLevel,
+    reachable: targetReqLevel <= estimatedMaxLevel
+  };
+}

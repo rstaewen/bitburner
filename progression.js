@@ -267,8 +267,8 @@ function handleFactionInvitations(ns, state, args) {
 }
 
 function getJoinedFactions(ns) {
-  const allFactions = Object.values(ns.enums.FactionName);
-  return allFactions.filter(f => ns.singularity.getFactionRep(f) > 0);
+  // Use actual joined factions list, not rep > 0 (rep persists across resets)
+  return ns.getPlayer().factions;
 }
 
 function wouldConflictWithJoined(faction, joinedFactions) {
@@ -549,10 +549,18 @@ export async function main(ns) {
     ['dry-run', false],
     ['debug', false],
     ['no-donate', false], // Disable donation purchasing
+    ['test-reset', false], // Test reset/NFG calculation without actually resetting
   ]);
   
   ns.disableLog('ALL');
   ns.ui.openTail();
+  
+  // Test mode: simulate reset and show what would happen
+  if (args['test-reset']) {
+    testResetSimulation(ns);
+    return;
+  }
+  
   ns.print('=== progression.js starting ===');
   
   const state = createInitialState(ns);
@@ -902,7 +910,7 @@ function getNextGraft(ns, state) {
 async function startStockTrader(ns, state) {
   if (state.stockTraderRunning) return;
   
-  const pid = ns.exec('stock-trader-4s.js', 'nexus');
+  const pid = ns.exec('stock-trader-4s.js', ns.getServer().hostname);
   if (pid > 0) {
     state.stockTraderPID = pid;
     state.stockTraderRunning = true;
@@ -918,7 +926,7 @@ async function stopStockTrader(ns, state) {
   if (state.stockTraderPID > 0) {
     ns.kill(state.stockTraderPID);
   }
-  ns.scriptKill('stock-trader-4s.js', 'nexus');
+  ns.scriptKill('stock-trader-4s.js', ns.getServer().hostname);
   
   state.stockTraderRunning = false;
   state.stockTraderPID = -1;
@@ -1514,8 +1522,9 @@ function topologicalSortByPrice(ns, augs, ownedAugs) {
 }
 
 function calculateNFGLevels(ns, remainingMoney, queueLength) {
-  const allFactions = Object.values(ns.enums.FactionName);
-  const joinedFactions = allFactions.filter(f => ns.singularity.getFactionRep(f) > 0);
+  // Use actual joined factions, not just factions with rep > 0
+  // Rep persists across resets, but membership doesn't
+  const joinedFactions = ns.getPlayer().factions;
   
   // Find the faction with the HIGHEST rep that offers NFG
   // This maximizes the number of NFG levels we can buy, since rep requirement increases per level
@@ -1537,7 +1546,8 @@ function calculateNFGLevels(ns, remainingMoney, queueLength) {
   }
   
   if (!nfgFaction) {
-    return { levels: 0, cost: 0 };
+    const initialRepReq = ns.singularity.getAugmentationRepReq("NeuroFlux Governor");
+    return { levels: 0, cost: 0, reason: `No faction meets NFG rep requirement of ${ns.formatNumber(initialRepReq)} (highest rep: ${ns.formatNumber(highestRep)})` };
   }
   
   // NFG rep requirement multiplier per level (from game source)
@@ -1567,6 +1577,13 @@ function calculateNFGLevels(ns, remainingMoney, queueLength) {
     currentIndex++;
     
     if (levels > 100) break;
+  }
+
+  if (levels === 0) {
+    const basePrice = ns.singularity.getAugmentationPrice("NeuroFlux Governor");
+    const multipliedPrice = basePrice * Math.pow(AUG_PRICE_MULTIPLIER, queueLength);
+    const repReq = ns.singularity.getAugmentationRepReq("NeuroFlux Governor");
+    return { levels, cost: totalCost, faction: nfgFaction, factionRep: highestRep, reason: `NFG from ${nfgFaction}: rep ${ns.formatNumber(highestRep)} vs req ${ns.formatNumber(repReq)}, money ${ns.formatNumber(remainingMoney)} vs cost ${ns.formatNumber(multipliedPrice)} (base ${ns.formatNumber(basePrice)} × 1.9^${queueLength})` };
   }
   
   return { levels, cost: totalCost, faction: nfgFaction, factionRep: highestRep };
@@ -1722,6 +1739,8 @@ async function executeReset(ns, state) {
         break;
       }
     }
+  } else if (nfg.reason) {
+    logs.push(`\nNo NFG purchased: ${nfg.reason}`);
   }
   
   const finalMoney = ns.getServerMoneyAvailable('home');
@@ -1974,4 +1993,84 @@ function formatTime(ms) {
   } else {
     return `${seconds}s`;
   }
+}
+
+// === TEST/DRY RUN ===
+
+function testResetSimulation(ns) {
+  ns.print('=== RESET SIMULATION (--test-reset) ===\n');
+  
+  const state = createInitialState(ns);
+  const money = ns.getServerMoneyAvailable('home');
+  const queue = buildAugQueue(ns, state);
+  
+  // Show current state
+  ns.print(`Current money: $${ns.formatNumber(money)}`);
+  ns.print(`Joined factions: ${ns.getPlayer().factions.join(', ')}`);
+  ns.print('');
+  
+  // Show aug queue
+  ns.print(`--- Aug Queue (${queue.augs.length} augs) ---`);
+  ns.print(`Total cost: $${ns.formatNumber(queue.totalCost)}`);
+  if (queue.augs.length > 0) {
+    for (let i = 0; i < Math.min(queue.augs.length, 10); i++) {
+      ns.print(`  ${i + 1}. ${queue.augs[i]}`);
+    }
+    if (queue.augs.length > 10) {
+      ns.print(`  ... and ${queue.augs.length - 10} more`);
+    }
+  }
+  ns.print('');
+  
+  // Simulate money after aug purchase
+  const moneyAfterAugs = money - queue.totalCost;
+  ns.print(`Money after augs: $${ns.formatNumber(moneyAfterAugs)}`);
+  ns.print('');
+  
+  // Show faction rep details
+  ns.print('--- Faction Rep (joined only) ---');
+  const joinedFactions = ns.getPlayer().factions;
+  const nfgRepReq = ns.singularity.getAugmentationRepReq("NeuroFlux Governor");
+  ns.print(`NFG base rep requirement: ${ns.formatNumber(nfgRepReq)}`);
+  
+  for (const faction of joinedFactions) {
+    const rep = ns.singularity.getFactionRep(faction);
+    const hasNFG = ns.singularity.getAugmentationsFromFaction(faction).includes("NeuroFlux Governor");
+    const meetsReq = rep >= nfgRepReq;
+    const status = hasNFG ? (meetsReq ? '✓' : '✗ (low rep)') : '(no NFG)';
+    ns.print(`  ${faction}: ${ns.formatNumber(rep)} ${status}`);
+  }
+  ns.print('');
+  
+  // Test NFG calculation
+  ns.print('--- NFG Calculation ---');
+  const nfg = calculateNFGLevels(ns, moneyAfterAugs, queue.augs.length);
+  
+  if (nfg.levels > 0) {
+    ns.print(`Would buy ${nfg.levels} NFG levels from ${nfg.faction}`);
+    ns.print(`NFG cost: $${ns.formatNumber(nfg.cost)}`);
+    ns.print(`Faction rep: ${ns.formatNumber(nfg.factionRep)}`);
+    ns.print(`Money after NFG: $${ns.formatNumber(moneyAfterAugs - nfg.cost)}`);
+  } else {
+    ns.print(`NFG levels: 0`);
+    if (nfg.reason) {
+      ns.print(`Reason: ${nfg.reason}`);
+    }
+    if (nfg.faction) {
+      ns.print(`Best faction: ${nfg.faction} (rep: ${ns.formatNumber(nfg.factionRep)})`);
+    }
+  }
+  ns.print('');
+  
+  // Show NFG price scaling for context
+  ns.print('--- NFG Price Scaling ---');
+  const baseNFGPrice = ns.singularity.getAugmentationPrice("NeuroFlux Governor");
+  ns.print(`Base NFG price: $${ns.formatNumber(baseNFGPrice)}`);
+  for (let i = 0; i <= 5; i++) {
+    const idx = queue.augs.length + i;
+    const price = baseNFGPrice * Math.pow(AUG_PRICE_MULTIPLIER, idx);
+    ns.print(`  After ${idx} augs: $${ns.formatNumber(price)}`);
+  }
+  
+  ns.print('\n=== END SIMULATION ===');
 }

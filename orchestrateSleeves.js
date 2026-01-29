@@ -31,6 +31,11 @@ const Jobs = Object.freeze({
   CRIME: 'commit crimes',
 });
 
+// Track failed company jobs to avoid thrashing
+// Maps company name -> timestamp of failure (to allow retry after cooldown)
+const failedCompanyJobs = new Map();
+const FAILED_JOB_COOLDOWN_MS = 60000; // Retry failed jobs after 60 seconds
+
 // === MAIN ===
 
 /** @param {NS} ns */
@@ -90,19 +95,27 @@ export async function main(ns) {
         let needsAction = false;
         
         if (desiredJob === Jobs.AUG) {
-          needsAction = !ns.isRunning("utils/augmentSleeve.js", "nexus", i);
+          needsAction = !ns.isRunning("utils/augmentSleeve.js", ns.getServer().hostname, i);
         } else if (desiredJob === Jobs.TRAIN) {
-          needsAction = !ns.isRunning("utils/trainSleeve.js", "nexus", i);
+          needsAction = !ns.isRunning("utils/trainSleeve.js", ns.getServer().hostname, i);
         } else if (desiredJob === Jobs.REP) {
           // Use the pre-computed reassignment flag
           needsAction = sleeveNeedsReassignment[i];
           
           // Also check if not doing faction/company work at all
+          // But if already doing crime, only reassign if there's actually a job available
           if (!task || (task.type !== "FACTION" && task.type !== "COMPANY")) {
-            needsAction = true;
+            if (task?.crimeType) {
+              // Already on crime fallback - only reassign if a real job exists
+              const potentialJob = getBestSleeveAssignment(ns, i, usedJobs);
+              needsAction = potentialJob !== null;
+              if (potentialJob) usedJobs.add(potentialJob.name); // Reserve it
+            } else {
+              needsAction = true;
+            }
           }
         } else if (desiredJob === Jobs.CRIME) {
-          needsAction = task?.type !== "CRIME";
+          needsAction = !task?.crimeType;
         }
         
         if (!needsAction) {
@@ -114,11 +127,11 @@ export async function main(ns) {
         
         // Assign the job
         if (desiredJob === Jobs.AUG) {
-          const pid = ns.exec("utils/augmentSleeve.js", "nexus", 1, i);
+          const pid = ns.exec("utils/augmentSleeve.js", ns.getServer().hostname, 1, i);
           ns.print(`Sleeve ${i}: Started augment purchasing, pid=${pid}`);
         } 
         else if (desiredJob === Jobs.TRAIN) {
-          const pid = ns.exec("utils/trainSleeve.js", "nexus", 1, i);
+          const pid = ns.exec("utils/trainSleeve.js", ns.getServer().hostname, 1, i);
           ns.print(`Sleeve ${i}: Started training, pid=${pid}`);
         } 
         else if (desiredJob === Jobs.REP) {
@@ -130,17 +143,25 @@ export async function main(ns) {
             if (success) {
               // Mark this job as used
               usedJobs.add(assignment.name);
+              // Clear from failed jobs if it was there
+              failedCompanyJobs.delete(assignment.name);
               ns.print(`Sleeve ${i}: ${assignment.type} - ${assignment.name} (${assignment.activity})`);
             } else {
               ns.print(`Sleeve ${i}: Failed to assign ${assignment.type} - ${assignment.name}`);
+              // Track failed company jobs to prevent thrashing
+              if (assignment.type === "company") {
+                failedCompanyJobs.set(assignment.name, Date.now());
+              }
               // Fallback to crime
               ns.sleeve.setToCommitCrime(i, "Homicide");
               ns.print(`Sleeve ${i}: Fallback to Homicide`);
             }
           } else {
-            // No valid assignment, commit crimes
-            ns.sleeve.setToCommitCrime(i, "Homicide");
-            ns.print(`Sleeve ${i}: No priority jobs available, committing Homicide`);
+            // No valid assignment - only assign to crime if not already doing it
+            if (task?.crimeType !== "Homicide") {
+              ns.sleeve.setToCommitCrime(i, "Homicide");
+              ns.print(`Sleeve ${i}: No priority jobs available, committing Homicide`);
+            }
           }
         }
         else if (desiredJob === Jobs.CRIME) {
@@ -163,8 +184,8 @@ export async function main(ns) {
 function killSleeveScripts(ns, sleeveNumber) {
   const scripts = ["utils/trainSleeve.js", "utils/augmentSleeve.js"];
   for (const script of scripts) {
-    if (ns.isRunning(script, "nexus", sleeveNumber)) {
-      ns.kill(script, "nexus", sleeveNumber);
+    if (ns.isRunning(script, ns.getServer().hostname, sleeveNumber)) {
+      ns.kill(script, ns.getServer().hostname, sleeveNumber);
       ns.print(`Sleeve ${sleeveNumber}: Killed ${script}`);
     }
   }
@@ -177,11 +198,14 @@ function killSleeveScripts(ns, sleeveNumber) {
 function getDesiredJob(ns, sleeveNumber) {
   const sleeve = ns.sleeve.getSleeve(sleeveNumber);
   const purchasableAugs = ns.sleeve.getSleevePurchasableAugs(sleeveNumber);
-  const avgExp = (sleeve.exp.agility + sleeve.exp.charisma + sleeve.exp.defense + sleeve.exp.dexterity + sleeve.exp.strength) / 5;
+  const avgExp = (sleeve.exp.agility + sleeve.exp.defense + sleeve.exp.dexterity + sleeve.exp.strength) / 4;
+  const avgPlayerExp = (ns.getPlayer().exp.agility + ns.getPlayer().exp.defense + ns.getPlayer().exp.dexterity + ns.getPlayer().exp.strength) / 4;
   
   if (purchasableAugs.length > 0 && sleeve.shock === 0) {
     return Jobs.AUG;
   } else if (avgExp < CONFIG.STAT_FLOOR) {
+    return Jobs.TRAIN;
+  } else if (avgPlayerExp < CONFIG.STAT_FLOOR) {
     return Jobs.TRAIN;
   } else {
     return Jobs.REP;
@@ -201,11 +225,24 @@ function getBestSleeveAssignment(ns, sleeveNumber, usedJobs) {
     deprioritizeDonatable: CONFIG.DEPRIORITIZE_DONATABLE_FACTIONS 
   });
   
-  // Find first job not already used by another sleeve
+  const now = Date.now();
+  
+  // Find first job not already used by another sleeve and not recently failed
   for (const job of jobs) {
-    if (!usedJobs.has(job.name)) {
-      return job;
+    if (usedJobs.has(job.name)) continue;
+    
+    // Check if this company job recently failed (still on cooldown)
+    if (job.type === "company" && failedCompanyJobs.has(job.name)) {
+      const failedAt = failedCompanyJobs.get(job.name);
+      if (now - failedAt < FAILED_JOB_COOLDOWN_MS) {
+        continue; // Skip, still on cooldown
+      } else {
+        // Cooldown expired, clear and allow retry
+        failedCompanyJobs.delete(job.name);
+      }
     }
+    
+    return job;
   }
   
   return null;

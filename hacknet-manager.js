@@ -17,6 +17,7 @@ import {
   getNexusInfo,
   copyScriptsToNexus,
   hasHacknetServers,
+  getBestHacknetBoostTarget,
 } from "utils/server-utils.js";
 
 import {
@@ -67,42 +68,15 @@ let studyingBoostsPurchased = 0;  // Track studying boosts for diminishing retur
 
 /**
  * Get the best server to target for max money/min security upgrades
- * Prioritizes fastest hack time servers, with n00dles being ideal
+ * Uses server-utils.js for centralized target selection that:
+ * - Persists across script restarts (stable for entire reset)
+ * - Picks highest-value reachable server based on estimated max hacking level
+ * - Excludes n00dles (too low max money, soft cap makes boosts worthless)
  * @param {NS} ns
  * @returns {string}
  */
 function getBestTargetServer(ns) {
-  // n00dles is always the best for max money upgrades
-  // (soft cap of 10t means all servers cap at same amount)
-  if (ns.serverExists("n00dles") && ns.hasRootAccess("n00dles")) {
-    return "n00dles";
-  }
-  
-  // Fallback: find server with lowest required hacking level
-  const visited = new Set();
-  const queue = ["home"];
-  let best = null;
-  let bestLevel = Infinity;
-  
-  while (queue.length > 0) {
-    const server = queue.shift();
-    if (visited.has(server)) continue;
-    visited.add(server);
-    
-    if (server !== "home" && ns.hasRootAccess(server) && ns.getServerMaxMoney(server) > 0) {
-      const level = ns.getServerRequiredHackingLevel(server);
-      if (level < bestLevel) {
-        bestLevel = level;
-        best = server;
-      }
-    }
-    
-    for (const neighbor of ns.scan(server)) {
-      if (!visited.has(neighbor)) queue.push(neighbor);
-    }
-  }
-  
-  return best || "n00dles";
+  return getBestHacknetBoostTarget(ns);
 }
 
 /**
@@ -213,6 +187,16 @@ function getHashActions(ns) {
   const hashes = ns.hacknet.numHashes();
   const capacity = ns.hacknet.hashCapacity();
   
+  // Get actual hash costs (these scale with purchases)
+  const actualCosts = {
+    sellForMoney: ns.hacknet.hashCost("Sell for Money"),
+    increaseMaxMoney: ns.hacknet.hashCost("Increase Maximum Money"),
+    reduceMinSecurity: ns.hacknet.hashCost("Reduce Minimum Security"),
+    improveStudying: ns.hacknet.hashCost("Improve Studying"),
+    improveGym: ns.hacknet.hashCost("Improve Gym Training"),
+    generateContract: ns.hacknet.hashCost("Generate Coding Contract"),
+  };
+  
   // Check BN9 studying priority FIRST to determine if we should skip selling
   let skipSellingForStudying = false;
   if (isInBitNode(ns, 9)) {
@@ -229,8 +213,8 @@ function getHashActions(ns) {
     actions.push({
       action: "Sell for Money",
       priority: 100,  // High priority early game
-      cost: CONFIG.HASH_COSTS.SELL_FOR_MONEY,
-      available: hashes >= CONFIG.HASH_COSTS.SELL_FOR_MONEY,
+      cost: actualCosts.sellForMoney,
+      available: hashes >= actualCosts.sellForMoney,
       execute: () => ns.hacknet.spendHashes("Sell for Money"),
     });
   }
@@ -250,8 +234,8 @@ function getHashActions(ns) {
       actions.push({
         action: "Improve Studying",
         priority: 150,  // Higher than selling for money (100)
-        cost: CONFIG.HASH_COSTS.IMPROVE_STUDYING,
-        available: hashes >= CONFIG.HASH_COSTS.IMPROVE_STUDYING,
+        cost: actualCosts.improveStudying,
+        available: hashes >= actualCosts.improveStudying,
         execute: () => {
           const success = ns.hacknet.spendHashes("Improve Studying");
           if (success) studyingBoostsPurchased++;
@@ -263,8 +247,8 @@ function getHashActions(ns) {
       actions.push({
         action: "Improve Studying",
         priority: 25,  // Lower priority until we hit 1 hash/sec
-        cost: CONFIG.HASH_COSTS.IMPROVE_STUDYING,
-        available: hashes >= CONFIG.HASH_COSTS.IMPROVE_STUDYING,
+        cost: actualCosts.improveStudying,
+        available: hashes >= actualCosts.improveStudying,
         execute: () => {
           const success = ns.hacknet.spendHashes("Improve Studying");
           if (success) studyingBoostsPurchased++;
@@ -279,29 +263,62 @@ function getHashActions(ns) {
   actions.push({
     action: "Improve Gym Training",
     priority: 30,
-    cost: CONFIG.HASH_COSTS.IMPROVE_GYM,
-    available: hashes >= CONFIG.HASH_COSTS.IMPROVE_GYM,
+    cost: actualCosts.improveGym,
+    available: hashes >= actualCosts.improveGym,
     execute: () => ns.hacknet.spendHashes("Improve Gym Training"),
   });
   
-  // Increase max money - good late game when hash capacity is high
+  // Increase max money / reduce min security - only if we have a valid target
+  // Target is null during early reset while leveling rate stabilizes
+  // Alternates between the two based on current server state
   const targetServer = getBestTargetServer(ns);
-  actions.push({
-    action: "Increase Maximum Money",
-    priority: 50,
-    cost: CONFIG.HASH_COSTS.INCREASE_MAX_MONEY,
-    available: hashes >= CONFIG.HASH_COSTS.INCREASE_MAX_MONEY,
-    execute: () => ns.hacknet.spendHashes("Increase Maximum Money", targetServer),
-  });
-  
-  // Reduce min security - always include, harmless if not needed
-  actions.push({
-    action: "Reduce Minimum Security",
-    priority: 40,
-    cost: CONFIG.HASH_COSTS.REDUCE_MIN_SECURITY,
-    available: hashes >= CONFIG.HASH_COSTS.REDUCE_MIN_SECURITY,
-    execute: () => ns.hacknet.spendHashes("Reduce Minimum Security", targetServer),
-  });
+  if (targetServer) {
+    const minSec = ns.getServerMinSecurityLevel(targetServer);
+    const maxMoney = ns.getServerMaxMoney(targetServer);
+    const MAX_MONEY_CAP = 10e12;  // 10 trillion soft cap
+    
+    // Determine which boost to prioritize based on current state
+    // Alternate: prioritize whichever has more room to improve
+    const canReduceSec = minSec > 1;
+    const canIncreaseMoney = maxMoney < MAX_MONEY_CAP;
+    
+    // Give higher priority to whichever we should do next
+    // If both available, alternate by giving slight edge to security (it helps hacking success)
+    let secPriority = 45;
+    let moneyPriority = 50;
+    
+    if (canReduceSec && canIncreaseMoney) {
+      // Alternate: prioritize security if it's still relatively high
+      // Security reduction is percentage-based, so more valuable when high
+      if (minSec > 10) {
+        secPriority = 55;  // Prioritize security reduction
+        moneyPriority = 50;
+      } else {
+        secPriority = 45;  // Prioritize money increase
+        moneyPriority = 50;
+      }
+    }
+    
+    if (canIncreaseMoney) {
+      actions.push({
+        action: `Increase Maximum Money (${targetServer})`,
+        priority: moneyPriority,
+        cost: actualCosts.increaseMaxMoney,
+        available: hashes >= actualCosts.increaseMaxMoney,
+        execute: () => ns.hacknet.spendHashes("Increase Maximum Money", targetServer),
+      });
+    }
+    
+    if (canReduceSec) {
+      actions.push({
+        action: `Reduce Minimum Security (${targetServer})`,
+        priority: secPriority,
+        cost: actualCosts.reduceMinSecurity,
+        available: hashes >= actualCosts.reduceMinSecurity,
+        execute: () => ns.hacknet.spendHashes("Reduce Minimum Security", targetServer),
+      });
+    }
+  }
   
   // Company favor - great for mid/late game
   // TODO: Connect to priorityJobs to find best company
@@ -317,12 +334,54 @@ function getHashActions(ns) {
   actions.push({
     action: "Generate Coding Contract",
     priority: 10,
-    cost: CONFIG.HASH_COSTS.GENERATE_CODING_CONTRACT,
-    available: hashes >= CONFIG.HASH_COSTS.GENERATE_CODING_CONTRACT,
+    cost: actualCosts.generateContract,
+    available: hashes >= actualCosts.generateContract,
     execute: () => ns.hacknet.spendHashes("Generate Coding Contract"),
   });
   
-  return actions.filter(a => a.available).sort((a, b) => b.priority - a.priority);
+  // Sort ALL actions by priority first (before filtering by availability)
+  // This lets us check if a high-priority action needs more cache capacity
+  const allActionsSorted = actions.sort((a, b) => b.priority - a.priority);
+  
+  // Check if the highest priority action needs more capacity than we have
+  // This must happen BEFORE filtering by availability, otherwise we miss capacity-blocked actions
+  if (allActionsSorted.length > 0) {
+    const topAction = allActionsSorted[0];
+    
+    if (topAction.cost > capacity) {
+      // Need to upgrade cache on node 0 (cheapest to keep upgrading same node)
+      const cacheUpgradeCost = ns.hacknet.getCacheUpgradeCost(0);
+      if (cacheUpgradeCost !== Infinity && cacheUpgradeCost > 0) {
+        // Return immediately with cache upgrade as only action
+        // This prevents any hash spending until capacity is upgraded
+        return [{
+          action: `⚠️ Need Cache Upgrade (node 0) for ${topAction.action}`,
+          priority: 999,
+          cost: topAction.cost,  // Show the hash cost we're trying to reach
+          available: true,
+          needsCacheUpgrade: true,
+          cacheUpgradeCost: cacheUpgradeCost,
+          execute: () => false,  // Don't execute hash spend, need $ upgrade first
+        }];
+      }
+    } else if (!topAction.available && topAction.cost <= capacity) {
+      // Top action CAN fit in capacity but we don't have enough hashes yet
+      // Return empty to force accumulation - don't spend on lower priority actions
+      return [{
+        action: `⏳ Saving for ${topAction.action}`,
+        priority: topAction.priority,
+        cost: topAction.cost,
+        available: false,
+        isWaitingForHashes: true,
+        execute: () => false,  // Don't execute anything, just wait
+      }];
+    }
+  }
+  
+  // Now filter to available actions only
+  const sortedActions = allActionsSorted.filter(a => a.available);
+  
+  return sortedActions;
 }
 
 /**
@@ -434,6 +493,23 @@ function getBestUpgrade(ns) {
   const money = ns.getServerMoneyAvailable("home");
   const numNodes = ns.hacknet.numNodes();
   
+  // Check if we need a cache upgrade to afford the next hash action
+  const hashActions = getHashActions(ns);
+  if (hashActions.length > 0 && hashActions[0].needsCacheUpgrade) {
+    const cacheUpgradeCost = hashActions[0].cacheUpgradeCost;
+    // Return cache upgrade as highest priority
+    return {
+      nodeIndex: 0,
+      upgradeType: 'cache',
+      cost: cacheUpgradeCost,
+      hashGain: 0,  // Cache doesn't add production
+      isAccumulating: money < cacheUpgradeCost,
+      isCacheForCapacity: true,  // Flag for display
+      targetHashCost: hashActions[0].cost,
+      roiDebug: { cacheUpgradeNeeded: true }
+    };
+  }
+  
   // Get nexus info to skip upgrades on nexus server
   const nexusInfo = getNexusInfo(ns);
   const nexusIndex = nexusInfo.server?.startsWith('hacknet-server-') 
@@ -479,19 +555,26 @@ function getBestUpgrade(ns) {
         best = newServerOption;
       }
     } else {
-      // No existing servers (or all are nexus), use simple estimate
-      const baseProduction = 0.001;
+      // No existing non-nexus servers - calculate actual new server production using formulas
+      // New server starts at level 1, 1GB RAM, 1 core
+      const player = ns.getPlayer();
+      const baseProduction = ns.formulas.hacknetServers.hashGainRate(1, 0, 1, 1, player.mults.hacknet_node_money);
       const newNodeCost = ns.hacknet.getPurchaseNodeCost();
       const ratio = baseProduction / newNodeCost;
       
+      newServerOption = {
+        nodeIndex: -1,
+        upgradeType: 'new',
+        cost: newNodeCost,
+        totalCost: newNodeCost,
+        hashGain: baseProduction,
+        canAfford: money >= newNodeCost
+      };
+      newServerRatio = ratio;
+      
       if (money >= newNodeCost && ratio > bestRatio) {
         bestRatio = ratio;
-        best = {
-          nodeIndex: -1,
-          upgradeType: 'new',
-          cost: newNodeCost,
-          hashGain: baseProduction
-        };
+        best = newServerOption;
       }
     }
   }
@@ -505,9 +588,13 @@ function getBestUpgrade(ns) {
     const currentProduction = stats.production;
     const isNexus = (i === nexusIndex);
     
+    // Check if nexus has scripts running (using RAM)
+    const nexusHasScripts = isNexus && ns.getServerUsedRam(nexusInfo.server) > 0;
+    
     for (const type of CONFIG.UPGRADE_TYPES) {
-      // Skip cores and level upgrades on nexus server (can't use them when full of scripts)
-      if (isNexus && (type === 'cores' || type === 'level')) {
+      // Skip cores and level upgrades on nexus server ONLY if scripts are running
+      // (can't upgrade level/cores while RAM is in use)
+      if (nexusHasScripts && (type === 'cores' || type === 'level')) {
         continue;
       }
       
@@ -920,10 +1007,34 @@ function printStatus(ns) {
   // Next actions
   ns.print("─── NEXT ACTIONS ───");
   
+  // Show hacknet boost target status
+  const boostTarget = getBestTargetServer(ns);
+  if (boostTarget) {
+    ns.print(`  Boost Target: ${boostTarget}`);
+  } else {
+    const resetInfo = ns.getResetInfo();
+    const hoursElapsed = (Date.now() - resetInfo.lastAugReset) / (1000 * 60 * 60);
+    ns.print(`  ⏳ Boost Target: None (${hoursElapsed.toFixed(1)}h < 1h min)`);
+    ns.print(`     → Max money/security boosts disabled until 1h into reset`);
+  }
+  
   // Hash spending
   const hashActions = getHashActions(ns);
   if (hashActions.length > 0) {
-    ns.print(`  Hash: ${hashActions[0].action} (${hashActions[0].cost}h)`);
+    const topAction = hashActions[0];
+    if (topAction.needsCacheUpgrade) {
+      // Show cache upgrade needed
+      ns.print(`  Hash: ${topAction.action}`);
+      ns.print(`     → Need ${ns.formatNumber(topAction.cost)}h capacity (current: ${ns.formatNumber(ns.hacknet.hashCapacity())}h)`);
+      ns.print(`     → Cache upgrade cost: $${ns.formatNumber(topAction.cacheUpgradeCost)}`);
+    } else if (topAction.isWaitingForHashes) {
+      // Show waiting for hashes with progress
+      const currentHashes = ns.hacknet.numHashes();
+      const pct = ((currentHashes / topAction.cost) * 100).toFixed(1);
+      ns.print(`  Hash: ${topAction.action} (${ns.formatNumber(currentHashes)}/${ns.formatNumber(topAction.cost)}h - ${pct}%)`);
+    } else {
+      ns.print(`  Hash: ${topAction.action} (${ns.formatNumber(topAction.cost)}h)`);
+    }
   } else {
     ns.print("  Hash: Accumulating...");
   }
@@ -933,7 +1044,15 @@ function printStatus(ns) {
   if (bestUpgrade) {
     const money = ns.getServerMoneyAvailable("home");
     
-    if (bestUpgrade.nodeIndex === -1) {
+    if (bestUpgrade.isCacheForCapacity) {
+      // Cache upgrade needed for hash capacity
+      if (bestUpgrade.isAccumulating) {
+        ns.print(`  💰 Saving: Cache upgrade node 0 ($${ns.formatNumber(bestUpgrade.cost)} / $${ns.formatNumber(money)})`);
+      } else {
+        ns.print(`  Buy: Cache upgrade node 0 ($${ns.formatNumber(bestUpgrade.cost)})`);
+      }
+      ns.print(`     → Needed for ${ns.formatNumber(bestUpgrade.targetHashCost)}h hash action`);
+    } else if (bestUpgrade.nodeIndex === -1) {
       // New node
       if (bestUpgrade.isAccumulating) {
         ns.print(`  💰 Saving for: New node ($${ns.formatNumber(bestUpgrade.cost)} / $${ns.formatNumber(money)})`);
@@ -1010,10 +1129,16 @@ function printStatus(ns) {
     
     // Convert hash gain to $/sec (1 hash = $250k when sold)
     const hashToMoney = 1e6 / CONFIG.HASH_COSTS.SELL_FOR_MONEY;  // $250k per hash
-    const incomeGain = targetHashGain * hashToMoney;
+    const hashIncomeGain = targetHashGain * hashToMoney;
+    const adjustedOutsideIncome = Math.pow(hackingIncome, 0.6);
     
-    // Payback time = cost / income gain from this upgrade
-    const paybackTime = incomeGain > 0 ? targetCost / incomeGain : Infinity;
+    // Effective income considers hash value PLUS sqrt(online income)
+    // This reflects that hashes support overall operations (max money boosts, etc.)
+    // sqrt() ensures we don't overspend when online income is low, but scale reasonably when high
+    const effectiveIncomeGain = hashIncomeGain + adjustedOutsideIncome;
+    
+    // Payback time = cost / effective income gain from this upgrade
+    const paybackTime = effectiveIncomeGain > 0 ? targetCost / effectiveIncomeGain : Infinity;
     const paybackStr = paybackTime < Infinity ? ns.tFormat(paybackTime * 1000) : '∞';
     
     // Time to afford = cost / cash flow
@@ -1021,7 +1146,8 @@ function printStatus(ns) {
     const affordStr = timeToAfford < Infinity ? ns.tFormat(timeToAfford * 1000) : '∞';
     
     ns.print(`  Next Target: ${targetName} ($${ns.formatNumber(targetCost)})`);
-    ns.print(`    → +${ns.formatNumber(targetHashGain)}/sec hash = +$${ns.formatNumber(incomeGain)}/sec`);
+    ns.print(`    → Effective value of next upgrade: $${ns.formatNumber(hashIncomeGain)}/sec hash + $${ns.formatNumber(adjustedOutsideIncome)}/sec (√online)`);
+    ns.print(`    → +${ns.formatNumber(targetHashGain)}/sec hash production`);
     ns.print(`    → Time to afford: ${affordStr}`);
     ns.print(`    → Payback time: ${paybackStr}`);
     
@@ -1084,11 +1210,15 @@ export async function main(ns) {
     const upgrade = getBestUpgrade(ns);
     if (upgrade && !upgrade.isAccumulating) {
       // Check payback time before executing
+      // Use hash income + adjusted online income to value upgrades beyond just selling hashes
       const hashGain = upgrade.hashGain || 0;
       const hashToMoney = 1e6 / CONFIG.HASH_COSTS.SELL_FOR_MONEY;
-      const incomeGain = hashGain * hashToMoney;
+      const hashIncomeGain = hashGain * hashToMoney;
+      const onlineIncome = ns.getTotalScriptIncome()[0];
+      const adjustedOutsideIncome = Math.pow(onlineIncome, 0.6);
+      const effectiveIncomeGain = hashIncomeGain + adjustedOutsideIncome;
       const upgradeCost = (upgrade.nodeIndex === -1 && upgrade.totalCost) ? upgrade.totalCost : upgrade.cost;
-      const paybackTime = incomeGain > 0 ? upgradeCost / incomeGain : Infinity;
+      const paybackTime = effectiveIncomeGain > 0 ? upgradeCost / effectiveIncomeGain : Infinity;
       
       if (paybackTime <= CONFIG.MAX_PAYBACK_TIME_SEC) {
         executeUpgrade(ns, upgrade);

@@ -680,8 +680,14 @@ export function getPriorityJobs(ns, stats, forSleeves = false, excludedJobs = ne
   // ========== COMPANY JOBS ==========
   // For each megacorp, check if we need company rep (to unlock faction or build favor)
   
+  // Get player's current jobs - can only work for companies we're employed at
+  const playerJobs = ns.getPlayer().jobs;
+  
   for (const company of MEGACORP_COMPANIES) {
     if (excludedJobs.has(company)) continue;
+    
+    // Skip if not employed at this company (can't work there)
+    if (!playerJobs[company]) continue;
     
     const companyRep = ns.singularity.getCompanyRep(company);
     const companyFavor = ns.singularity.getCompanyFavor(company);

@@ -9,6 +9,11 @@ import {
   getNexusInfo,
   getHacknetServers,
   hasHacknetServers,
+  getBlacklistServers,
+  isServerBlacklisted,
+  getPriorityTargets,
+  getPriorityTargetsByLevel,
+  getBestHacknetBoostTarget,
 } from "utils/server-utils.js";
 
 // =============================================================================
@@ -56,48 +61,8 @@ const MAX_HACK_THREADS_PER_BATCH = 100;  // Split hacks into chunks of this size
 // Servers with growth rate below this are blacklisted (e.g., fulcrumassets=1, foodnstuff=5)
 const MIN_GROWTH_RATE = 15;
 
-// Blacklisted servers - never hack these, they're not worth the thread cost
-// Generated from server-analyzer.js: servers with growthRate <= 10
-const BLACKLIST_SERVERS = [
-  "fulcrumassets",  // growth=1, needs 67k threads to grow, earns $368/s - absolute worst
-  "foodnstuff",     // growth=5, needs 3.9k threads, deceptively bad early game trap
-  "sigma-cosmetics", // growth=10, needs 1.9k threads
-  // NOTE: n00dles is NOT blacklisted despite low max money ($1.75m)
-  // Its growth rate of 3000 means only ~7 threads to fully grow
-  // Perfect bootstrapper: minimal thread cost, instant cycling, good early XP
-];
-
-// Priority prep targets by hacking level tier
-// From server-analyzer.js output - best $/sec servers at each level range
-const PRIORITY_PREP_TARGETS_BY_LEVEL = {
-  // Level 1-100: Very early game - n00dles is the ultimate bootstrapper
-  // Only needs ~10 threads total to cycle, generates seed money while real targets prep
-  0: ["n00dles", "joesguns", "harakiri-sushi", "hong-fang-tea", "nectar-net", "neo-net"],
-  
-  // Level 101-300: Early game - n00dles still useful but diminishing returns
-  100: ["n00dles", "max-hardware", "joesguns", "harakiri-sushi", "zer0", "phantasy", "nectar-net"],
-  
-  // Level 301-500: Early-mid game - n00dles becomes irrelevant, drop from list
-  300: ["omega-net", "phantasy", "silver-helix", "crush-fitness", "max-hardware", "iron-gym"],
-  
-  // Level 501-700: Mid game
-  500: ["computek", "the-hub", "catalyst", "summit-uni", "rho-construction", "omega-net"],
-  
-  // Level 701-900: Mid-late game
-  700: ["rho-construction", "alpha-ent", "computek", "the-hub", "catalyst", "lexo-corp"],
-  
-  // Level 901-1100: Late game
-  900: ["alpha-ent", "rho-construction", "lexo-corp", "global-pharm", "zb-institute", "computek"],
-  
-  // Level 1101-1300: End game begins
-  1100: ["kuai-gong", "b-and-a", "4sigma", "blade", "nwo", "clarkinc", "megacorp", "omnitek"],
-  
-  // Level 1301-1500: End game
-  1300: ["ecorp", "megacorp", "nwo", "blade", "clarkinc", "b-and-a", "4sigma", "kuai-gong"],
-  
-  // Level 1501+: Max level
-  1500: ["ecorp", "megacorp", "nwo", "clarkinc", "blade", "b-and-a", "4sigma", "kuai-gong", "omnitek"],
-};
+// BLACKLIST_SERVERS and PRIORITY_PREP_TARGETS_BY_LEVEL moved to utils/server-utils.js
+// Use getBlacklistServers(), isServerBlacklisted(), getPriorityTargets(), getPriorityTargetsByLevel()
 
 // =============================================================================
 // SERVER STATE MACHINE
@@ -487,7 +452,7 @@ function getSortedTargets(ns, targetServers) {
   const scored = [];
   for (const target of targetServers) {
     // Skip blacklisted servers entirely
-    if (BLACKLIST_SERVERS.includes(target)) continue;
+    if (isServerBlacklisted(target)) continue;
     
     if (!ns.hasRootAccess(target)) continue;
     if (ns.getServerRequiredHackingLevel(target) > hackLevel) continue;
@@ -518,29 +483,23 @@ function getSortedTargets(ns, targetServers) {
  * @returns {string[]}
  */
 function getPriorityPrepTargets(ns, unprepedServers) {
-  const hackLevel = ns.getHackingLevel();
-  
   // Filter out blacklisted servers first
-  const validServers = unprepedServers.filter(s => !BLACKLIST_SERVERS.includes(s));
+  const validServers = unprepedServers.filter(s => !isServerBlacklisted(s));
   
-  // Find the appropriate priority list for current hacking level
-  const levelTiers = Object.keys(PRIORITY_PREP_TARGETS_BY_LEVEL)
-    .map(Number)
-    .sort((a, b) => b - a); // Sort descending
+  // Hacknet boost target gets absolute priority - prep it first
+  const hacknetTarget = getBestHacknetBoostTarget(ns);
   
-  let priorityNames = [];
-  for (const tier of levelTiers) {
-    if (hackLevel >= tier) {
-      priorityNames = PRIORITY_PREP_TARGETS_BY_LEVEL[tier];
-      break;
-    }
-  }
+  // Get priority targets for current hacking level from server-utils
+  const priorityNames = getPriorityTargets(ns);
   
   // Partition into priority and non-priority
   const priority = [];
   const rest = [];
   
   for (const server of validServers) {
+    // Hacknet target handled separately
+    if (server === hacknetTarget) continue;
+    
     if (priorityNames.includes(server)) {
       priority.push(server);
     } else {
@@ -562,7 +521,12 @@ function getPriorityPrepTargets(ns, unprepedServers) {
     return stateB.profitScore - stateA.profitScore;
   });
   
-  return [...priority, ...rest];
+  // Hacknet target goes FIRST if it needs prep
+  const result = [...priority, ...rest];
+  if (hacknetTarget && validServers.includes(hacknetTarget)) {
+    return [hacknetTarget, ...result];
+  }
+  return result;
 }
 
 // =============================================================================
@@ -1981,8 +1945,20 @@ export async function main(ns) {
     // PHASE 7: Start New Cycle Batches (Hack or Grow)
     // =========================================================================
     
+    // Hacknet boost target gets priority - process it first with full threads
+    const hacknetTarget = getBestHacknetBoostTarget(ns);
+    
+    // Sort prepped list to put hacknet target first
+    const sortedPrepped = [...prepped];
+    if (hacknetTarget && sortedPrepped.includes(hacknetTarget)) {
+      // Move hacknet target to front
+      const idx = sortedPrepped.indexOf(hacknetTarget);
+      sortedPrepped.splice(idx, 1);
+      sortedPrepped.unshift(hacknetTarget);
+    }
+    
     // Process prepped servers that are ready or need grow
-    for (const target of prepped) {
+    for (const target of sortedPrepped) {
       const state = getServerState(target);
       
       // Skip if scripts are running (safety check)

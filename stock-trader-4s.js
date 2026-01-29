@@ -3,7 +3,7 @@
 const CONFIG = {
   commission: 100_000,
   cycleDelay: 10_000,
-  cashReserve: 10_000_000,
+  cashReserve: 0.01,
   allowShorting: false,
   excessCashForShorts: 1_000_000_000,
   minPurchase: 10_000_000,  // Don't buy positions smaller than this
@@ -290,7 +290,7 @@ function liquidateShort(ns, stock, hasStrongShortPosition) {
 }
 
 function executePurchases(ns, buyPriority, marketState) {
-  let available = ns.getServerMoneyAvailable("home") - CONFIG.cashReserve;
+  let available = getAvailableCash(ns);
 
   if (available <= CONFIG.commission) {
     return;
@@ -354,12 +354,18 @@ function executePurchases(ns, buyPriority, marketState) {
   }
 }
 
+// Returns the amount of cash available for trading. 
+// Reserves at between 10M (minimum) and 100% - CONFIG.cashReserve (maximum) (default 99% of cash)
+function getAvailableCash(ns) {
+  return Math.max(0, Math.min(ns.getServerMoneyAvailable("home") - 10_000_000, ns.getServerMoneyAvailable("home") * (1.0 - CONFIG.cashReserve)));
+}
+
 function shouldEngageShorts(ns) {
   return ns.getServerMoneyAvailable("home") > CONFIG.excessCashForShorts;
 }
 
 function executeShorts(ns, shortPriority, marketState) {
-  let available = ns.getServerMoneyAvailable("home") - CONFIG.cashReserve;
+  let available = getAvailableCash(ns);
   if (available <= CONFIG.commission) return;
 
   for (const entry of shortPriority) {
