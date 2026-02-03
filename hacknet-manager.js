@@ -259,10 +259,10 @@ function getHashActions(ns) {
     // If at cap, don't add studying action at all
   }
   
-  // Improve gym - lower priority than studying
+  // Improve gym - same priority as server boosts, cost tiebreaker handles alternation
   actions.push({
     action: "Improve Gym Training",
-    priority: 30,
+    priority: 50,  // Same as server boosts - cost determines order
     cost: actualCosts.improveGym,
     available: hashes >= actualCosts.improveGym,
     execute: () => ns.hacknet.spendHashes("Improve Gym Training"),
@@ -270,39 +270,20 @@ function getHashActions(ns) {
   
   // Increase max money / reduce min security - only if we have a valid target
   // Target is null during early reset while leveling rate stabilizes
-  // Alternates between the two based on current server state
+  // All boost actions share priority 50 - cost tiebreaker ensures natural alternation
   const targetServer = getBestTargetServer(ns);
   if (targetServer) {
     const minSec = ns.getServerMinSecurityLevel(targetServer);
     const maxMoney = ns.getServerMaxMoney(targetServer);
     const MAX_MONEY_CAP = 10e12;  // 10 trillion soft cap
     
-    // Determine which boost to prioritize based on current state
-    // Alternate: prioritize whichever has more room to improve
     const canReduceSec = minSec > 1;
     const canIncreaseMoney = maxMoney < MAX_MONEY_CAP;
-    
-    // Give higher priority to whichever we should do next
-    // If both available, alternate by giving slight edge to security (it helps hacking success)
-    let secPriority = 45;
-    let moneyPriority = 50;
-    
-    if (canReduceSec && canIncreaseMoney) {
-      // Alternate: prioritize security if it's still relatively high
-      // Security reduction is percentage-based, so more valuable when high
-      if (minSec > 10) {
-        secPriority = 55;  // Prioritize security reduction
-        moneyPriority = 50;
-      } else {
-        secPriority = 45;  // Prioritize money increase
-        moneyPriority = 50;
-      }
-    }
     
     if (canIncreaseMoney) {
       actions.push({
         action: `Increase Maximum Money (${targetServer})`,
-        priority: moneyPriority,
+        priority: 50,  // Same priority as other boosts - cost determines order
         cost: actualCosts.increaseMaxMoney,
         available: hashes >= actualCosts.increaseMaxMoney,
         execute: () => ns.hacknet.spendHashes("Increase Maximum Money", targetServer),
@@ -312,7 +293,7 @@ function getHashActions(ns) {
     if (canReduceSec) {
       actions.push({
         action: `Reduce Minimum Security (${targetServer})`,
-        priority: secPriority,
+        priority: 50,  // Same priority as other boosts - cost determines order
         cost: actualCosts.reduceMinSecurity,
         available: hashes >= actualCosts.reduceMinSecurity,
         execute: () => ns.hacknet.spendHashes("Reduce Minimum Security", targetServer),
@@ -339,9 +320,13 @@ function getHashActions(ns) {
     execute: () => ns.hacknet.spendHashes("Generate Coding Contract"),
   });
   
-  // Sort ALL actions by priority first (before filtering by availability)
-  // This lets us check if a high-priority action needs more cache capacity
-  const allActionsSorted = actions.sort((a, b) => b.priority - a.priority);
+  // Sort ALL actions by priority first, then by cost (cheaper = better) as tiebreaker
+  // This ensures natural alternation among equal-priority actions (e.g., server boosts)
+  // After buying one action, its cost increases, making the other cheaper and thus preferred
+  const allActionsSorted = actions.sort((a, b) => {
+    if (b.priority !== a.priority) return b.priority - a.priority;
+    return a.cost - b.cost;  // Cheaper action wins when priority is equal
+  });
   
   // Check if the highest priority action needs more capacity than we have
   // This must happen BEFORE filtering by availability, otherwise we miss capacity-blocked actions
@@ -364,10 +349,9 @@ function getHashActions(ns) {
           execute: () => false,  // Don't execute hash spend, need $ upgrade first
         }];
       }
-    } else if (!topAction.available && topAction.cost <= capacity && topAction.priority >= 100) {
+    } else if (!topAction.available && topAction.cost <= capacity) {
       // Top action CAN fit in capacity but we don't have enough hashes yet
-      // Only wait for truly high-priority actions (studying at 150, selling at 100)
-      // Don't wait for similar-priority actions like min sec (55) vs max money (50)
+      // Wait for it to accumulate rather than spending on lower priority actions
       return [{
         action: `⏳ Saving for ${topAction.action}`,
         priority: topAction.priority,
@@ -410,8 +394,14 @@ function spendHashes(ns) {
     return false;
   }
   
-  // Execute highest priority available action
+  // Check if we're waiting for hashes to accumulate - don't spend anything
   const action = actions[0];
+  if (action.isWaitingForHashes) {
+    // Don't sell as fallback - we're saving up for a specific action
+    return false;
+  }
+  
+  // Execute highest priority available action
   const success = action.execute();
   
   if (success) {
@@ -849,7 +839,7 @@ function executeUpgrade(ns, upgrade) {
  * @param {NS} ns
  */
 async function handleBN9Nexus(ns) {
-  if (!isInBitNode(ns, 9)) return;
+  if (!hasHacknetServers(ns)) return;
   
   const numNodes = ns.hacknet.numNodes();
   
@@ -1131,7 +1121,7 @@ function printStatus(ns) {
     // Convert hash gain to $/sec (1 hash = $250k when sold)
     const hashToMoney = 1e6 / CONFIG.HASH_COSTS.SELL_FOR_MONEY;  // $250k per hash
     const hashIncomeGain = targetHashGain * hashToMoney;
-    const adjustedOutsideIncome = Math.pow(hackingIncome, 0.7);
+    const adjustedOutsideIncome = Math.pow(Math.max(0, hackingIncome), 0.7);
     
     // Effective income considers hash value PLUS sqrt(online income)
     // This reflects that hashes support overall operations (max money boosts, etc.)

@@ -61,6 +61,10 @@ const MAX_HACK_THREADS_PER_BATCH = 100;  // Split hacks into chunks of this size
 // Servers with growth rate below this are blacklisted (e.g., fulcrumassets=1, foodnstuff=5)
 const MIN_GROWTH_RATE = 15;
 
+// Hacknet-boosted server reservation
+// When enabled, reserves G+H+W threads for the boosted server before distributing to others
+const RESERVE_BOOSTED_SERVER_THREADS = true;
+
 // BLACKLIST_SERVERS and PRIORITY_PREP_TARGETS_BY_LEVEL moved to utils/server-utils.js
 // Use getBlacklistServers(), isServerBlacklisted(), getPriorityTargets(), getPriorityTargetsByLevel()
 
@@ -206,6 +210,79 @@ function clearBatch(state) {
   state.batchEndTime = 0;
   state.batchType = '';
   state.batchThreads = 0;
+}
+
+/**
+ * Calculate the RAM needed to run a full G+H+W cycle for a server
+ * Used to reserve capacity for the hacknet-boosted server
+ * @param {NS} ns
+ * @param {string} target
+ * @returns {{ramNeeded: number, growThreads: number, hackThreads: number, weakenThreads: number}}
+ */
+function calculateBoostedServerReservation(ns, target) {
+  // Mid-cycle stat change assumptions from hacknet boosts:
+  // - Max money could increase by ~5% during a cycle
+  // - Min security could decrease by ~5% during a cycle (absolute security points!)
+  const EXPECTED_MAX_MONEY_INCREASE = 0.05;    // 5% max money increase
+  const EXPECTED_MIN_SEC_DECREASE = 0.05;      // 5% of current min security as absolute drop
+  
+  if (!target || !ns.serverExists(target)) {
+    return { ramNeeded: 0, growThreads: 0, hackThreads: 0, weakenThreads: 0 };
+  }
+  
+  const server = ns.getServer(target);
+  const player = ns.getPlayer();
+  const maxMoney = server.moneyMax;
+  const minSecurity = server.minDifficulty;
+  
+  if (maxMoney <= 0) {
+    return { ramNeeded: 0, growThreads: 0, hackThreads: 0, weakenThreads: 0 };
+  }
+  
+  // Simulate prepped state
+  server.hackDifficulty = minSecurity;
+  server.moneyAvailable = maxMoney;
+  
+  // Calculate hack threads (from 100% to 5%) - no buffer needed, hack amount is fixed
+  const hackPercent = ns.formulas.hacking.hackPercent(server, player);
+  if (hackPercent <= 0) {
+    return { ramNeeded: 0, growThreads: 0, hackThreads: 0, weakenThreads: 0 };
+  }
+  
+  const targetMoney = maxMoney * TARGET_MONEY_AFTER_HACK;
+  const toSteal = maxMoney - targetMoney;
+  const hackThreads = Math.ceil(toSteal / (hackPercent * maxMoney));
+  
+  // Calculate grow threads for INCREASED max money target
+  // If max money increases 5% mid-cycle, we need to grow to the new higher max
+  const projectedMaxMoney = maxMoney * (1 + EXPECTED_MAX_MONEY_INCREASE);
+  server.moneyAvailable = maxMoney * TARGET_MONEY_AFTER_HACK;
+  const growThreads = Math.ceil(ns.formulas.hacking.growThreads(server, player, projectedMaxMoney));
+  
+  // Calculate weaken threads to counter hack + grow security increases
+  const hackSecIncrease = hackThreads * 0.002;
+  const growSecIncrease = growThreads * 0.004;
+  const baseSecIncrease = hackSecIncrease + growSecIncrease;
+  
+  // PLUS extra weaken for expected min security decrease
+  // Scale by cycle duration - longer cycles = more potential hacknet boosts
+  // Assume at most one boost per minute, so multiply by (cycleSeconds / 60)
+  const cycleTime = ns.formulas.hacking.weakenTime(server, player);
+  const cycleMinutes = Math.max(1, cycleTime / 1000 / 60);
+  const expectedSecurityDrop = minSecurity * EXPECTED_MIN_SEC_DECREASE * cycleMinutes;
+  const totalSecIncrease = baseSecIncrease + expectedSecurityDrop;
+  
+  const homeCores = ns.getServer("home").cpuCores;
+  const reductionPerThread = ns.weakenAnalyze(1, homeCores);
+  const weakenThreads = Math.ceil(totalSecIncrease / reductionPerThread);
+  
+  // Calculate RAM needed
+  const hackRam = ns.getScriptRam("hack.js");
+  const growRam = ns.getScriptRam("grow.js");
+  const weakenRam = ns.getScriptRam("weaken.js");
+  const ramNeeded = (hackThreads * hackRam) + (growThreads * growRam) + (weakenThreads * weakenRam);
+  
+  return { ramNeeded, growThreads, hackThreads, weakenThreads };
 }
 
 // =============================================================================
@@ -1208,9 +1285,10 @@ function executeGrowWeakenBatch(ns, target, runners, runnerNames) {
  * @param {string} target
  * @param {{name: string, cores: number, availableRam: number}[]} runners
  * @param {string[]} runnerNames
+ * @param {boolean} [bypassThreadLimit=false] - If true, ignore GHW_BATCH_MAX_THREADS limit (for boosted server)
  * @returns {{deployed: number, type: string, duration: number, growThreads: number, hackThreads: number, weakenThreads: number}}
  */
-function executeGrowHackWeakenBatch(ns, target, runners, runnerNames) {
+function executeGrowHackWeakenBatch(ns, target, runners, runnerNames, bypassThreadLimit = false) {
   const state = getServerState(target);
   const server = ns.getServer(target);
   const player = ns.getPlayer();
@@ -1266,7 +1344,8 @@ function executeGrowHackWeakenBatch(ns, target, runners, runnerNames) {
   const totalThreads = growThreads + hackThreads + weakenThreads;
   
   // Check if this batch is too large for combined approach
-  if (totalThreads > GHW_BATCH_MAX_THREADS) {
+  // Bypass this check for hacknet-boosted server (it always gets the full G+H+W treatment)
+  if (totalThreads > GHW_BATCH_MAX_THREADS && !bypassThreadLimit) {
     return { deployed: 0, type: 'too_large', duration: 0, growThreads, hackThreads, weakenThreads };
   }
   
@@ -1536,6 +1615,14 @@ function printStatus(ns, stats, runners) {
   if (hasHacknetServers(ns)) {
     const hacknetCount = getHacknetServers(ns).length;
     ns.print(`🔗 Hacknet Servers: ${hacknetCount} (excluded)`);
+  }
+  
+  // Boosted server status
+  const boostedTarget = getBestHacknetBoostTarget(ns);
+  if (boostedTarget && RESERVE_BOOSTED_SERVER_THREADS) {
+    const reservation = calculateBoostedServerReservation(ns, boostedTarget);
+    const totalThreads = reservation.growThreads + reservation.hackThreads + reservation.weakenThreads;
+    ns.print(`⭐ Boosted: ${boostedTarget} (reserved ${ns.formatRam(reservation.ramNeeded)}, G:${reservation.growThreads} H:${reservation.hackThreads} W:${reservation.weakenThreads} = ${totalThreads}t)`);
   }
   
   ns.print(`🎮 Hacking Level: ${ns.getHackingLevel()}`);
@@ -1831,7 +1918,36 @@ export async function main(ns) {
     const remainingPrepBudget = Math.max(0, maxPrepThreads - runningPrepThreads);
     
     // Available threads for NEW deployments this cycle
-    const availableThreads = getTotalAvailableThreads(ns, runnerServers, "weaken.js");
+    let availableThreads = getTotalAvailableThreads(ns, runnerServers, "weaken.js");
+    
+    // =========================================================================
+    // PHASE 4a: Reserve RAM for Hacknet-Boosted Server
+    // =========================================================================
+    
+    // Calculate and reserve RAM for the boosted server's G+H+W cycle
+    // This ensures the boosted server always has enough capacity
+    const boostedTarget = getBestHacknetBoostTarget(ns);
+    let boostedReservation = { ramNeeded: 0, growThreads: 0, hackThreads: 0, weakenThreads: 0 };
+    let boostedServerReservedRam = 0;
+    
+    if (RESERVE_BOOSTED_SERVER_THREADS && boostedTarget && prepped.includes(boostedTarget)) {
+      boostedReservation = calculateBoostedServerReservation(ns, boostedTarget);
+      
+      // Only reserve if we have enough total capacity
+      // Get total available RAM (not just threads)
+      let totalAvailRam = 0;
+      for (const runner of runnerServers) {
+        totalAvailRam += ns.getServerMaxRam(runner) - ns.getServerUsedRam(runner);
+      }
+      
+      if (totalAvailRam >= boostedReservation.ramNeeded) {
+        boostedServerReservedRam = boostedReservation.ramNeeded;
+        // Subtract reserved RAM from available threads for other servers
+        // (boosted server will use this when it processes first)
+        const reservedThreads = Math.ceil(boostedReservation.ramNeeded / weakenRam);
+        availableThreads = Math.max(0, availableThreads - reservedThreads);
+      }
+    }
     
     // Actual prep budget is the minimum of remaining budget and available RAM
     const prepBudget = Math.min(remainingPrepBudget, availableThreads);
@@ -1971,16 +2087,19 @@ export async function main(ns) {
       runners = getSortedRunners(ns, runnerServers);
       if (runners.length === 0) break;
       
+      // Check if this is the boosted server (bypasses thread limit)
+      const isBoostedServer = target === hacknetTarget;
+      
       if (state.phase === 'GROWING') {
         // Server is mid-cycle and needs grow - try combined G+H+W first
-        const ghwResult = executeGrowHackWeakenBatch(ns, target, runners, runnerServers);
+        const ghwResult = executeGrowHackWeakenBatch(ns, target, runners, runnerServers, isBoostedServer);
         
         if (ghwResult.deployed > 0) {
           // Successfully deployed combined batch
           cycleThreadsUsed += ghwResult.deployed;
           hackingThreads += ghwResult.hackThreads;
         } else if (ghwResult.type === 'too_large' || ghwResult.type === 'insufficient_ram' || ghwResult.type === '') {
-          // Fall back to separate G+W batch
+          // Fall back to separate G+W batch (only for non-boosted servers)
           const gwResult = executeGrowWeakenBatch(ns, target, runners, runnerServers);
           if (gwResult.deployed > 0) {
             cycleThreadsUsed += gwResult.deployed;
@@ -1994,14 +2113,14 @@ export async function main(ns) {
         
         if (moneyRatio < MONEY_THRESHOLD) {
           // Low money - need to grow first, try combined G+H+W batch
-          const ghwResult = executeGrowHackWeakenBatch(ns, target, runners, runnerServers);
+          const ghwResult = executeGrowHackWeakenBatch(ns, target, runners, runnerServers, isBoostedServer);
           
           if (ghwResult.deployed > 0) {
             // Successfully deployed combined batch
             cycleThreadsUsed += ghwResult.deployed;
             hackingThreads += ghwResult.hackThreads;
           } else if (ghwResult.type === 'too_large' || ghwResult.type === 'insufficient_ram') {
-            // Fall back to separate G+W batch
+            // Fall back to separate G+W batch (only for non-boosted servers)
             const gwResult = executeGrowWeakenBatch(ns, target, runners, runnerServers);
             if (gwResult.deployed > 0) {
               cycleThreadsUsed += gwResult.deployed;

@@ -1,9 +1,9 @@
 /** @param {NS} ns */
 export async function main(ns) {
-  ns.kill("orchestrateSleeves.js", "nexus");
-  ns.exec("orchestrateSleeves.js", "nexus");
-  ns.kill("progression.js", "nexus");
-  ns.exec("progression.js", "nexus");
-  ns.kill("managejobs.js", "nexus");
-  ns.exec("managejobs.js", "nexus");
+  ns.kill("orchestrateSleeves.js", ns.getServer().hostname);
+  ns.exec("orchestrateSleeves.js", ns.getServer().hostname);
+  ns.kill("progression.js", ns.getServer().hostname);
+  ns.exec("progression.js", ns.getServer().hostname);
+  ns.kill("managejobs.js", ns.getServer().hostname);
+  ns.exec("managejobs.js", ns.getServer().hostname);
 }

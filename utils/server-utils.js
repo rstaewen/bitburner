@@ -167,7 +167,13 @@ function readNexusDesignation(ns) {
     if (ns.fileExists(NEXUS_DESIGNATION_FILE, 'home')) {
       const data = JSON.parse(ns.read(NEXUS_DESIGNATION_FILE));
       if (data.server && ns.serverExists(data.server)) {
-        return data;
+        // Validate that designation was made in the current reset
+        // (hacknet servers are deleted on aug reset in BN9)
+        const resetTime = ns.getResetInfo().lastAugReset;
+        if (data.designatedAt && data.designatedAt > resetTime) {
+          return data;
+        }
+        // Stale designation from previous reset - ignore it
       }
     }
   } catch (e) {

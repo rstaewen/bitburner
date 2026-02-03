@@ -1,5 +1,5 @@
 /** @param {NS} ns */
-import { getServerValues, getServerEfficiencies, getServerXPEfficiencies, getBestHacknetBoostTarget } from '/utils/server-utils.js';
+import { getServerValues, getServerEfficiencies, getServerXPEfficiencies, getBestHacknetBoostTarget, copyScriptsToNexus } from '/utils/server-utils.js';
 
 export async function main(ns) {
   ns.ui.openTail();
@@ -30,6 +30,16 @@ export async function main(ns) {
   for (const s of sortedByEfficiency) {
     ns.print(`  ${s.server}: $${ns.formatNumber(s.efficiency)}/s/thread (value: $${ns.formatNumber(s.value)}/s, threads: ${s.totalThreads}, reqLevel: ${s.reqLevel})`);
   }
+
+  // Sort by efficiency and show top 15
+  const sortedByInefficiency = Array.from(efficiencies.values())
+    .sort((a, b) => a.efficiency - b.efficiency)
+    .slice(0, 10);
+
+  ns.print("\Worst 10 servers by efficiency ($/sec/thread):");
+  for (const s of sortedByInefficiency) {
+    ns.print(`  ${s.server}: $${ns.formatNumber(s.efficiency)}/s/thread (value: $${ns.formatNumber(s.value)}/s, threads: ${s.totalThreads}, reqLevel: ${s.reqLevel})`);
+  }
   
   ns.print("\n=== Testing getServerXPEfficiencies ===");
   const xpEfficiencies = getServerXPEfficiencies(ns);
@@ -37,9 +47,9 @@ export async function main(ns) {
   // Sort by XP efficiency and show top 15
   const sortedByXP = Array.from(xpEfficiencies.values())
     .sort((a, b) => b.xpEfficiency - a.xpEfficiency)
-    .slice(0, 15);
+    .slice(0, 5);
   
-  ns.print("\nTop 15 servers by XP efficiency (XP/thread/sec):");
+  ns.print("\nTop 5 servers by XP efficiency (XP/thread/sec):");
   for (const s of sortedByXP) {
     ns.print(`  ${s.server}: ${ns.formatNumber(s.xpEfficiency)} XP/t/s (xp/thread: ${ns.formatNumber(s.xpPerThread)}, cycle: ${s.cycleTime.toFixed(1)}s, reqLevel: ${s.reqLevel})`);
   }
@@ -47,4 +57,6 @@ export async function main(ns) {
   ns.print("\n=== Testing getBestHacknetBoostTarget ===");
   const target = getBestHacknetBoostTarget(ns);
   ns.print(`Selected target: ${target}`);
+
+  copyScriptsToNexus(ns);
 }
