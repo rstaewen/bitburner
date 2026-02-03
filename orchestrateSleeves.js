@@ -17,7 +17,7 @@ import {
 
 const CONFIG = {
   CHECK_INTERVAL: 1000,
-  STAT_FLOOR: 10000, // Average exp threshold for training
+  STAT_FLOOR: 40000, // Average exp threshold for training
   DEPRIORITIZE_DONATABLE_FACTIONS: true, // Match progression.js setting
 };
 

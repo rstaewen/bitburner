@@ -61,11 +61,13 @@ const GRAFT_PRIORITY = [
   "The Black Hand",
   
   // === MID GAME ===
-  "Social Negotiation Assistant (S.N.A)",
   "BitRunners Neurolink",
   "Xanipher",
-  "ECorp HVMind Implant",
-  "SPTN-97 Gene Modification"
+  "ECorp HVMind Implant", // ecorp exclusive, exepnsive
+  "SPTN-97 Gene Modification",
+  
+  "PC Direct-Neural Interface", //+30% rep, prereq for following two (omnitek, ecorp)
+  "PC Direct-Neural Interface NeuroNet Injector", //+100% rep from companies, essential for unlocking more factions, (fulcrum exclusive) - 1.5m rep, too expensive to be useful except as graft
   
   // === LATE GAME (disabled for now - manually trigger if needed) ===
   // "QLink",                    // $75t - only needed for high-hacking BitNodes
@@ -742,6 +744,7 @@ function updatePhase(ns, state) {
   } 
   else if (!hasEarlyGrafts(state) || !isRamSaturated(ns, state)) {
     state.phase = Phase.EARLY_ACCELERATION;
+    //ns.print(`reason we're in early accel: has early grafts: ${hasEarlyGrafts(state)} ram saturated: ${isRamSaturated(ns, state)}`)
   }
   else if (!state.has4SData || !state.has4STIX) {
     state.phase = Phase.PASSIVE_INCOME;
@@ -772,7 +775,7 @@ function hasEarlyGrafts(state) {
 }
 
 function hasMidGameGrafts(state) {
-  const midGrafts = GRAFT_PRIORITY.slice(4, 9);
+  const midGrafts = GRAFT_PRIORITY.slice(4, 10);
   return midGrafts.every(aug => state.graftsCompleted.includes(aug));
 }
 
@@ -1556,7 +1559,7 @@ function calculateNFGLevels(ns, remainingMoney, queueLength) {
   let levels = 0;
   let totalCost = 0;
   let currentMoney = remainingMoney;
-  let currentIndex = queueLength;
+  let currentIndex = 0;
   
   while (true) {
     // Check price constraint
@@ -1731,7 +1734,7 @@ async function executeReset(ns, state) {
   const nfg = calculateNFGLevels(ns, remainingMoney, purchasedCount);
   
   if (nfg.levels > 0) {
-    logs.push(`\nBuying ${nfg.levels} NeuroFlux Governor levels...`);
+    logs.push(`\nBuying ${nfg.levels} NeuroFlux Governor levels from ${nfg.faction} with ${nfg.factionRep} rep`);
     for (let i = 0; i < nfg.levels; i++) {
       const success = ns.singularity.purchaseAugmentation(nfg.faction, "NeuroFlux Governor");
       if (!success) {

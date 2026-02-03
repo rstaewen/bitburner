@@ -20,9 +20,12 @@ import {
   canPurchaseHacknets,
   hasHacknetServers,
   isHacknetBitNode,
+  execSingleton
 } from "utils/server-utils.js";
 
 import { isRamSaturated } from "utils/ram.js";
+
+import { getCurrentNode } from "utils/bitnode-cache.js"
 
 // Configuration
 const CONFIG = {
@@ -31,6 +34,7 @@ const CONFIG = {
   SATURATION_THRESHOLD_MS: 60000, // 1 minute before entering sleep mode
   WAKE_THRESHOLD_MS: 60000,       // 1 minute of non-saturation before waking
   HACKNET_MANAGER_SCRIPT: "hacknet-manager.js",
+  HACKING_ORCHESTRATOR_SCRIPT: "orchestratorv2.js",
   NEXUS_SCRIPT: "nexus.js",
 };
 
@@ -166,17 +170,35 @@ function areAllServersMaxed(ns) {
   return true;
 }
 
+function ensureHackingOrchestrator(ns) {
+  // Try to spawn singleton on home
+  if (ns.fileExists(CONFIG.HACKING_ORCHESTRATOR_SCRIPT, "home")) {
+    const pid = execSingleton(ns, CONFIG.HACKING_ORCHESTRATOR_SCRIPT, "home", false);
+    if (pid > 0) {
+      ns.tprint(`[ORCHESTRATOR] Spawned hacking orchestrator on home, pid:[${pid}] `);
+      return true;
+    } else {
+      ns.tprint(`[ORCHESTRATOR] Failed to spawn! Probably insufficient RAM`);
+    }
+  }
+  return false;
+}
+
 /**
  * Spawn hacknet manager if not already running
  * @param {NS} ns
  * @returns {boolean} Whether spawn was successful or already running
  */
 function ensureHacknetManager(ns) {
-  if (hacknetManagerSpawned) return true;
-  
+  if (hacknetManagerSpawned) {
+    ns.tprint(`[MANAGER] ${CONFIG.HACKNET_MANAGER_SCRIPT} already tagged running in var`);
+    return true;
+  }
+
   // Check if already running on home
   if (ns.isRunning(CONFIG.HACKNET_MANAGER_SCRIPT, "home")) {
     hacknetManagerSpawned = true;
+    ns.tprint(`[MANAGER] ${CONFIG.HACKNET_MANAGER_SCRIPT} already running on home`);
     return true;
   }
   
@@ -184,6 +206,7 @@ function ensureHacknetManager(ns) {
   const nexus = getNexusHost(ns, 64);
   if (nexus && ns.isRunning(CONFIG.HACKNET_MANAGER_SCRIPT, nexus)) {
     hacknetManagerSpawned = true;
+    ns.tprint(`[MANAGER] ${CONFIG.HACKNET_MANAGER_SCRIPT} already running on nexus`);
     return true;
   }
   
@@ -191,9 +214,12 @@ function ensureHacknetManager(ns) {
   if (ns.fileExists(CONFIG.HACKNET_MANAGER_SCRIPT, "home")) {
     const pid = ns.exec(CONFIG.HACKNET_MANAGER_SCRIPT, "home", 1);
     if (pid > 0) {
-      ns.print(`[MANAGER] Spawned hacknet-manager.js on home (PID: ${pid})`);
+      ns.tprint(`[MANAGER] Spawned hacknet-manager.js on home (PID: ${pid})`);
       hacknetManagerSpawned = true;
       return true;
+    } else {
+      ns.tprint(`[MANAGER] Failed to spawn hacknet-manager.js on home. Likely insufficient RAM`);
+      return false;
     }
   }
   
@@ -201,13 +227,16 @@ function ensureHacknetManager(ns) {
   if (nexus && ns.fileExists(CONFIG.HACKNET_MANAGER_SCRIPT, nexus)) {
     const pid = ns.exec(CONFIG.HACKNET_MANAGER_SCRIPT, nexus, 1);
     if (pid > 0) {
-      ns.print(`[MANAGER] Spawned hacknet-manager.js on ${nexus} (PID: ${pid})`);
+      ns.tprint(`[MANAGER] Spawned hacknet-manager.js on ${nexus} (PID: ${pid})`);
       hacknetManagerSpawned = true;
       return true;
+    } else {
+      ns.tprint(`[MANAGER] Failed to spawn hacknet-manager.js on ${nexus}. Likely insufficient RAM`);
+      return false;
     }
   }
   
-  ns.print(`[MANAGER] ${CONFIG.HACKNET_MANAGER_SCRIPT} not found on home`);
+  ns.tprint(`[MANAGER] ${CONFIG.HACKNET_MANAGER_SCRIPT} not found on home`);
   return false;
 }
 
@@ -360,11 +389,13 @@ export async function main(ns) {
   ns.tail();
   
   ns.print("Starting Server Manager...");
-  ns.print(`BitNode: ${ns.getResetInfo().currentNode}`);
+  ns.print(`BitNode: ${getCurrentNode(ns)}`);
   ns.print(`Can purchase servers: ${canPurchaseServers(ns)}`);
   ns.print(`Can purchase hacknets: ${canPurchaseHacknets(ns)}`);
   ns.print(`Nexus target RAM: ${ns.formatRam(getNexusTargetRam(ns))}`);
   ns.print("");
+
+  await ns.sleep(1000);
   
   // Special handling for BN9 (or when servers aren't purchasable)
   if (!canPurchaseServers(ns)) {
@@ -384,6 +415,9 @@ export async function main(ns) {
   if (canPurchaseHacknets(ns)) {
     ensureHacknetManager(ns);
   }
+  
+  // Spawn hacking orchestrator if needed
+  ensureHackingOrchestrator(ns);
   
   // Main loop
   while (true) {

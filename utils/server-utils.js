@@ -1,6 +1,11 @@
 /** @param {NS} ns */
 
 import { getAllServers } from '/utils/scanner.js';
+import {
+  isInBitNode,
+  getSourceFileLevel,
+  getLastAugReset
+} from "utils/bitnode-cache.js";
 
 /**
  * server-utils.js - Centralized server knowledge and management
@@ -22,12 +27,31 @@ const NEXUS_DESIGNATION_FILE = '/data/nexus-designation.json';
 const NEXUS_TARGET_RAM_BASE = 512; // GB - base target before SF4 multipliers
 
 /**
+ * @param {NS} ns
+ * @param {string} script
+ * @param {string} targetServer
+ * @param {boolean} withRestart
+ * @returns {number}
+ */
+export function execSingleton(ns, script, targetServer, withRestart) {
+  if (withRestart) {
+    ns.kill(script, targetServer);
+    return ns.exec(script, targetServer);
+  } else {
+    if (!ns.isRunning(script, targetServer)) {
+      return ns.exec(script, targetServer);
+    }
+  }
+  return 0;
+}
+
+/**
  * Check if we're in BitNode 9 (Hacktocracy)
  * @param {NS} ns
  * @returns {boolean}
  */
 export function isHacknetBitNode(ns) {
-  return ns.getResetInfo().currentNode === 9;
+  return isInBitNode(ns, 9)
 }
 
 /**
@@ -64,9 +88,7 @@ export function canPurchaseHacknets(ns) {
  */
 export function hasHacknetServers(ns) {
   // If we're in BN9 or have SF9, hacknet "nodes" are actually servers
-  const currentNode = ns.getResetInfo().currentNode;
-  const sf9Level = ns.getResetInfo().ownedSF[9] || 0;
-  return currentNode === 9 || sf9Level > 0;
+  return isInBitNode(ns, 9) || getSourceFileLevel(ns, 9) > 0;
 }
 
 /**
@@ -91,27 +113,6 @@ export function getHacknetServers(ns) {
 }
 
 /**
- * Get the SF4 (Singularity) source file level
- * @param {NS} ns
- * @returns {number}
- */
-function getSF4Level(ns) {
-  const ownedSF = ns.getResetInfo().ownedSF;
-  
-  // ownedSF is a Map, not a plain object
-  if (ownedSF instanceof Map) {
-    return ownedSF.get(4) ?? 0;
-  }
-  
-  // Fallback for potential future API changes
-  if (ownedSF && typeof ownedSF === 'object') {
-    return ownedSF[4] ?? ownedSF["4"] ?? 0;
-  }
-  
-  return 0;
-}
-
-/**
  * Get the RAM cost multiplier for singularity functions based on SF4 level
  * Based on actual game mechanics:
  * - BN4: 1x (no penalty)
@@ -122,15 +123,12 @@ function getSF4Level(ns) {
  * @returns {number}
  */
 export function getSingularityRamMultiplier(ns) {
-  const currentNode = ns.getResetInfo().currentNode;
-  const sf4Level = getSF4Level(ns);
-  
   // In BN4, no penalty
-  if (currentNode === 4) return 1;
+  if (isInBitNode(ns, 4)) return 1;
   
   // SF4 levels reduce the RAM cost
   // These are the actual game multipliers
-  switch (sf4Level) {
+  switch (getSourceFileLevel(ns, 4)) {
     case 0: return 16;  // No SF4 = 16x RAM cost
     case 1: return 16;  // SF4-1 = 16x
     case 2: return 4;   // SF4-2 = 4x
@@ -167,13 +165,7 @@ function readNexusDesignation(ns) {
     if (ns.fileExists(NEXUS_DESIGNATION_FILE, 'home')) {
       const data = JSON.parse(ns.read(NEXUS_DESIGNATION_FILE));
       if (data.server && ns.serverExists(data.server)) {
-        // Validate that designation was made in the current reset
-        // (hacknet servers are deleted on aug reset in BN9)
-        const resetTime = ns.getResetInfo().lastAugReset;
-        if (data.designatedAt && data.designatedAt > resetTime) {
-          return data;
-        }
-        // Stale designation from previous reset - ignore it
+        return data;
       }
     }
   } catch (e) {
@@ -418,7 +410,7 @@ export function getRunnerServers(ns, includeHome = false) {
  * @returns {string[]}
  */
 function getAllHomeFiles(ns) {
-  return ns.ls("home").filter(f => f.endsWith(".js"));
+  return ns.ls("home").filter(f => f.endsWith(".js") || f.endsWith(".json"));
 }
 
 /**
@@ -718,7 +710,7 @@ function readHacknetBoostTarget(ns) {
       const data = JSON.parse(ns.read(HACKNET_BOOST_TARGET_FILE));
       if (data.target && typeof data.target === 'string') {
         // Validate that this cache was created in the current reset
-        const resetTime = ns.getResetInfo().lastAugReset;
+        const resetTime = getLastAugReset(ns);
         if (data.selectedAt && data.selectedAt > resetTime) {
           return data.target;
         }
@@ -981,8 +973,7 @@ function estimateMaxHackingLevel(ns) {
   const DECAY_FACTOR = 0.15;  // Very conservative
   
   // Calculate time since last aug reset
-  const resetInfo = ns.getResetInfo();
-  const lastAugReset = resetInfo.lastAugReset;
+  const lastAugReset = getLastAugReset(ns);
   const hoursElapsed = (Date.now() - lastAugReset) / (1000 * 60 * 60);
   
   // If we're past the projection horizon, just use current level
@@ -1032,10 +1023,9 @@ export function getBestHacknetBoostTarget(ns) {
   const MIN_HOURS_BEFORE_CACHE = 1;
   
   // ALWAYS check elapsed time FIRST - this is the gate for early reset
-  const resetInfo = ns.getResetInfo();
-  const hoursElapsed = (Date.now() - resetInfo.lastAugReset) / (1000 * 60 * 60);
+  const hoursElapsed = (Date.now() - getLastAugReset(ns)) / (1000 * 60 * 60);
   
-  if (hoursElapsed < MIN_HOURS_BEFORE_CACHE) {
+  if (hoursElapsed < MIN_HOURS_BEFORE_CACHE && estimateMaxHackingLevel(ns) < 1500) {
     // Too early - return null to signal "not ready yet"
     // Callers should skip boost actions when target is null
     // Clear any stale caches (memory and file)
@@ -1052,7 +1042,7 @@ export function getBestHacknetBoostTarget(ns) {
   }
   
   // Check memory cache - but validate it's from current reset
-  if (cachedHacknetBoostTarget && cachedHacknetBoostTargetResetTime === resetInfo.lastAugReset) {
+  if (cachedHacknetBoostTarget && cachedHacknetBoostTargetResetTime === getLastAugReset(ns)) {
     return cachedHacknetBoostTarget;
   }
   
@@ -1061,7 +1051,7 @@ export function getBestHacknetBoostTarget(ns) {
   const fileTarget = readHacknetBoostTarget(ns);
   if (fileTarget) {
     cachedHacknetBoostTarget = fileTarget;
-    cachedHacknetBoostTargetResetTime = resetInfo.lastAugReset;
+    cachedHacknetBoostTargetResetTime = getLastAugReset(ns);
     return cachedHacknetBoostTarget;
   }
   
@@ -1084,7 +1074,7 @@ export function getBestHacknetBoostTarget(ns) {
   if (reachableServers.length > 0) {
     const best = reachableServers[0];
     cachedHacknetBoostTarget = best.server;
-    cachedHacknetBoostTargetResetTime = resetInfo.lastAugReset;
+    cachedHacknetBoostTargetResetTime = getLastAugReset(ns);
     writeHacknetBoostTarget(ns, cachedHacknetBoostTarget);
     ns.print(`[SERVER-UTILS] Selected hacknet boost target: ${cachedHacknetBoostTarget}`);
     ns.print(`  → Value: $${ns.formatNumber(best.value)}/s, MaxMoney: $${ns.formatNumber(best.maxMoney)}, ReqLevel: ${best.reqLevel}`);
@@ -1095,7 +1085,7 @@ export function getBestHacknetBoostTarget(ns) {
   // Fallback to joesguns if somehow nothing else matched
   // This should only happen very early in a reset
   cachedHacknetBoostTarget = "joesguns";
-  cachedHacknetBoostTargetResetTime = resetInfo.lastAugReset;
+  cachedHacknetBoostTargetResetTime = getLastAugReset(ns);
   writeHacknetBoostTarget(ns, cachedHacknetBoostTarget);
   ns.print(`[SERVER-UTILS] Fallback hacknet boost target: joesguns (no reachable servers found)`);
   return cachedHacknetBoostTarget;

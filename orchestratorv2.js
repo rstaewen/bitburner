@@ -21,7 +21,7 @@ import {
 // =============================================================================
 
 // Calculate delay for grow so it lands 200ms before weaken
-const LAND_BUFFER = 150;
+const LAND_BUFFER = 200;
 const CYCLE_DELAY = 1000;              // 1 second between orchestrator cycles
 const MAX_ACTIVITY_LOG = 12;           // Recent activity entries to display
 const INFO_FILE = '/data/orchestrator-info.json';
@@ -1533,11 +1533,15 @@ async function writeOrchestratorInfo(ns, stats) {
     cyclingServers: stats.cyclingServers
   };
   
-  await ns.write(INFO_FILE, JSON.stringify(info), 'w');
+  ns.write(INFO_FILE, JSON.stringify(info), 'w');
   
-  // Copy to nexus if it exists
-  if (ns.serverExists("nexus")) {
-    ns.scp(INFO_FILE, "nexus");
+  const nexusInfo = getNexusInfo(ns);
+  let copied = false;
+  if (nexusInfo.server) {
+    copied = ns.scp(INFO_FILE, nexusInfo.server);
+  }
+  if (!copied) {
+    //ns.tprint("FAILED to copy orchestrator saturation to nexus");
   }
 }
 

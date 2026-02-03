@@ -69,17 +69,12 @@ export function getMultiplier(ns, key, defaultValue = 1) {
 
 /**
  * Get the current bitnode number from cache
- * Falls back to direct API if cache is missing (costs 1GB RAM)
  * @param {NS} ns
  * @returns {number}
  */
 export function getCurrentNode(ns) {
   const cache = getBitNodeCache(ns);
-  if (cache?.resetInfo?.currentNode) {
-    return cache.resetInfo.currentNode;
-  }
-  // Fallback to direct API if cache missing - this is critical for correctness
-  return ns.getResetInfo().currentNode;
+  return cache?.resetInfo?.currentNode ?? 1;
 }
 
 /**

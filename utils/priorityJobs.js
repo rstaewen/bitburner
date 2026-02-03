@@ -37,7 +37,6 @@ const KEY_AUGS = [
   "SPTN-97 Gene Modification", //+75% all combat skills, +15% for hacking, even more awesome! (covenant ex)
   "PC Direct-Neural Interface", //+30% rep, prereq for following two (omnitek, ecorp)
   "PC Direct-Neural Interface Optimization Submodule", //+75% rep from companies (fulcrum, ecorp)
-  "PC Direct-Neural Interface NeuroNet Injector", //+100% rep from companies, essential for unlocking more factions, (fulcrum exclusive)
   "Neotra", //+55% STR, DEX
   "Hydroflame Left Arm", //+180% STR, last priority hopefully
   "nextSENS Gene Modification", //+20% all skills clarke ex
@@ -128,7 +127,6 @@ const TARGET_FAVOR_AFTER_RESET = 35;
 // PC Direct family gives company rep bonuses, should be acquired BEFORE company grinding
 const PRIORITY_MODIFIERS = {
   "PC Direct-Neural Interface": 0.5,           // Base prereq for the family
-  "PC Direct-Neural Interface NeuroNet Injector": 0.5, // +100% company rep (Fulcrum exclusive)
   "PC Direct-Neural Interface Optimization Submodule": 0.5, // +75% company rep
 };
 

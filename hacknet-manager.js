@@ -24,6 +24,8 @@ import {
   isInBitNode,
   getMultiplier,
   isCacheValid,
+  getLastAugReset,
+  getCurrentNode
 } from "utils/bitnode-cache.js";
 
 // Configuration
@@ -335,7 +337,7 @@ function getHashActions(ns) {
     
     if (topAction.cost > capacity) {
       // Need to upgrade cache on node 0 (cheapest to keep upgrading same node)
-      const cacheUpgradeCost = ns.hacknet.getCacheUpgradeCost(0);
+      const cacheUpgradeCost = ns.hacknet.numNodes() > 0 ? ns.hacknet.getCacheUpgradeCost(0) : Infinity;
       if (cacheUpgradeCost !== Infinity && cacheUpgradeCost > 0) {
         // Return immediately with cache upgrade as only action
         // This prevents any hash spending until capacity is upgraded
@@ -377,9 +379,10 @@ function getHashActions(ns) {
 function spendHashes(ns) {
   const hashes = ns.hacknet.numHashes();
   const capacity = ns.hacknet.hashCapacity();
+  const nodeCount = ns.hacknet.numNodes();
   
-  // Don't spend if we're below reserve and not near capacity
-  if (hashes < CONFIG.HASH_RESERVE && hashes < capacity * 0.9) {
+  // Don't spend if we're below reserve and not near capacity or don't have any hacknodes to begin with
+  if ((hashes < CONFIG.HASH_RESERVE && hashes < capacity * 0.9) || nodeCount === 0) {
     return false;
   }
   
@@ -483,6 +486,9 @@ function getUpgradeCostToMatch(ns, targetStats) {
 function getBestUpgrade(ns) {
   const money = ns.getServerMoneyAvailable("home");
   const numNodes = ns.hacknet.numNodes();
+  if (numNodes === 0) {
+    return 
+  }
   
   // Check if we need a cache upgrade to afford the next hash action
   const hashActions = getHashActions(ns);
@@ -1003,7 +1009,7 @@ function printStatus(ns) {
   if (boostTarget) {
     ns.print(`  Boost Target: ${boostTarget}`);
   } else {
-    const resetInfo = ns.getResetInfo();
+    const resetInfo = getLastAugReset(ns);
     const hoursElapsed = (Date.now() - resetInfo.lastAugReset) / (1000 * 60 * 60);
     ns.print(`  ⏳ Boost Target: None (${hoursElapsed.toFixed(1)}h < 1h min)`);
     ns.print(`     → Max money/security boosts disabled until 1h into reset`);
@@ -1167,7 +1173,7 @@ export async function main(ns) {
   ns.tail();
   
   ns.print("Starting Hacknet Manager...");
-  ns.print(`BitNode: ${ns.getResetInfo().currentNode}`);
+  ns.print(`BitNode: ${getCurrentNode(ns)}`);
   ns.print(`Has hacknet servers: ${hasHacknetServers(ns)}`);
   
   // Initialize studying boosts from current game state
