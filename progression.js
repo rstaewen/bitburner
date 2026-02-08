@@ -55,14 +55,13 @@ const CONFIG = {
 
 const GRAFT_PRIORITY = [
   // === EARLY GAME (cheap, immediate ROI) ===
-  "Neural Accelerator",
-  "Neuralstimulator",
-  "PCMatrix",
-  "The Black Hand",
+  "The Black Hand", //$1.6b (great ROI! perfect for first reset graft, almost impossible to get on first reset normally)
+  "Neural Accelerator", //$5b
+  "PCMatrix", //$6b
   
   // === MID GAME ===
-  "BitRunners Neurolink",
-  "Xanipher",
+  "BitRunners Neurolink", //$13b
+  "Xanipher", //12.7b
   "ECorp HVMind Implant", // ecorp exclusive, exepnsive
   "SPTN-97 Gene Modification",
   
@@ -770,12 +769,12 @@ function allHackingToolsOwned(state) {
 }
 
 function hasEarlyGrafts(state) {
-  const earlyGrafts = GRAFT_PRIORITY.slice(0, 4);
+  const earlyGrafts = GRAFT_PRIORITY.slice(0, 3);
   return earlyGrafts.every(aug => state.graftsCompleted.includes(aug));
 }
 
 function hasMidGameGrafts(state) {
-  const midGrafts = GRAFT_PRIORITY.slice(4, 10);
+  const midGrafts = GRAFT_PRIORITY.slice(3, 9);
   return midGrafts.every(aug => state.graftsCompleted.includes(aug));
 }
 
@@ -1068,7 +1067,7 @@ async function executeEarlyAcceleration(ns, state, args) {
   if (state.graftFailures >= 3) return; // Don't attempt if we've failed too many times
   
   const nextGraft = getNextGraft(ns, state);
-  const earlyGrafts = GRAFT_PRIORITY.slice(0, 4);
+  const earlyGrafts = GRAFT_PRIORITY.slice(0, 3);
   
   if (nextGraft && earlyGrafts.includes(nextGraft)) {
     attemptGraft(ns, state, args, nextGraft);

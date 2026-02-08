@@ -7,6 +7,7 @@ export async function main(ns) {
   const augs = ns.sleeve.getSleevePurchasableAugs(SLEEVE_NUMBER).sort();
   while (augs.length > 0) {
     let failedPuchase = false;
+    let failedAugs = [];
     for (let i = 0; i< augs.length; i++) {
       if (augs[i].name == "QLink") {
         ns.tprint("DO NOT BUY QLINK!");
@@ -14,9 +15,10 @@ export async function main(ns) {
       }
       let succededPurchase = ns.sleeve.purchaseSleeveAug(SLEEVE_NUMBER, augs[i].name);
       failedPuchase |= !succededPurchase;
+      failedAugs.push(augs[i].name);
     }
     if (failedPuchase) {
-      ns.print("Failed purchase! waiting 10s")
+      ns.print(`Failed purchase for ${failedAugs.join(", ")}! waiting 10s`)
     } else {
       return true;
     }
