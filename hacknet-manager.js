@@ -18,6 +18,7 @@ import {
   copyScriptsToNexus,
   hasHacknetServers,
   getBestHacknetBoostTarget,
+  tryDesignateNexus,
 } from "utils/server-utils.js";
 
 import {
@@ -32,7 +33,7 @@ import {
 const CONFIG = {
   CYCLE_DELAY_MS: 2000,           // 2 seconds between cycles
   HASH_RESERVE: 4,                // Minimum hashes to keep in reserve
-  MONEY_SELL_THRESHOLD: 0.5,      // Sell hashes if online income < 50% of hash income potential
+  MONEY_SELL_THRESHOLD: 0.5,      // Sell hashes if online income < 50% of hash income potential (BN9 uses for income-starved detection)
   NEXUS_SCRIPT: "nexus.js",
   
   // BN9 studying optimization
@@ -199,43 +200,34 @@ function getHashActions(ns) {
     generateContract: ns.hacknet.hashCost("Generate Coding Contract"),
   };
   
-  // Check BN9 studying priority FIRST to determine if we should skip selling
-  let skipSellingForStudying = false;
-  if (isInBitNode(ns, 9)) {
+  const inBN9 = isInBitNode(ns, 9);
+  
+  if (inBN9) {
     const hashProduction = getTotalHashProduction(ns);
     const currentMultiplier = 1 + (studyingBoostsPurchased * CONFIG.STUDYING_BOOST_PER_USE);
     const hasEnoughProduction = hashProduction >= CONFIG.STUDYING_HASH_RATE_THRESHOLD;
     const notAtCap = currentMultiplier < CONFIG.STUDYING_MAX_MULTIPLIER;
-    skipSellingForStudying = hasEnoughProduction && notAtCap;
-  }
-  
-  // Sell for money - only if we're not making money from hacking
-  // AND not prioritizing studying in BN9
-  if (shouldSellHashesForMoney(ns) && !skipSellingForStudying) {
-    actions.push({
-      action: "Sell for Money",
-      priority: 100,  // High priority early game
-      cost: actualCosts.sellForMoney,
-      available: hashes >= actualCosts.sellForMoney,
-      execute: () => ns.hacknet.spendHashes("Sell for Money"),
-    });
-  }
-  
-  // Improve studying - critical in BN9 where hacking XP is gimped (5%)
-  // Only prioritize once we have decent hash production (1 hash/sec)
-  // Stop once we hit diminishing returns (5x boost)
-  if (isInBitNode(ns, 9)) {
-    const hashProduction = getTotalHashProduction(ns);
-    const currentMultiplier = 1 + (studyingBoostsPurchased * CONFIG.STUDYING_BOOST_PER_USE);
-    const hasEnoughProduction = hashProduction >= CONFIG.STUDYING_HASH_RATE_THRESHOLD;
-    const notAtCap = currentMultiplier < CONFIG.STUDYING_MAX_MULTIPLIER;
-    
+    const studyingCapped = !notAtCap;
+    const onlineIncome = getOnlineIncomeRate(ns);
+    const hashMoneyRate = getHashMoneyRate(ns);
+    const incomeStarved = onlineIncome < hashMoneyRate * CONFIG.MONEY_SELL_THRESHOLD;
+    const shouldSellInBN9 = incomeStarved && (studyingCapped || !hasEnoughProduction);
+
+    if (shouldSellInBN9) {
+      actions.push({
+        action: "Sell for Money",
+        priority: studyingCapped ? 150 : 90,
+        cost: actualCosts.sellForMoney,
+        available: hashes >= actualCosts.sellForMoney,
+        execute: () => ns.hacknet.spendHashes("Sell for Money"),
+        reason: studyingCapped ? "studying_capped" : "low_production",
+      });
+    }
+
     if (hasEnoughProduction && notAtCap) {
-      // HIGHEST priority - studying is critical for BN9 progression
-      // Must be higher than selling for money (100)
       actions.push({
         action: "Improve Studying",
-        priority: 150,  // Higher than selling for money (100)
+        priority: 150,
         cost: actualCosts.improveStudying,
         available: hashes >= actualCosts.improveStudying,
         execute: () => {
@@ -245,10 +237,9 @@ function getHashActions(ns) {
         },
       });
     } else if (notAtCap) {
-      // Low production - add as lower priority option (still better than nothing if at hash cap)
       actions.push({
         action: "Improve Studying",
-        priority: 25,  // Lower priority until we hit 1 hash/sec
+        priority: 25,
         cost: actualCosts.improveStudying,
         available: hashes >= actualCosts.improveStudying,
         execute: () => {
@@ -258,7 +249,14 @@ function getHashActions(ns) {
         },
       });
     }
-    // If at cap, don't add studying action at all
+  } else if (shouldSellHashesForMoney(ns)) {
+    actions.push({
+      action: "Sell for Money",
+      priority: 100,
+      cost: actualCosts.sellForMoney,
+      available: hashes >= actualCosts.sellForMoney,
+      execute: () => ns.hacknet.spendHashes("Sell for Money"),
+    });
   }
   
   // Improve gym - same priority as server boosts, cost tiebreaker handles alternation
@@ -487,9 +485,9 @@ function getBestUpgrade(ns) {
   const money = ns.getServerMoneyAvailable("home");
   const numNodes = ns.hacknet.numNodes();
   if (numNodes === 0) {
-    return 
+    return;
   }
-  
+
   // Check if we need a cache upgrade to afford the next hash action
   const hashActions = getHashActions(ns);
   if (hashActions.length > 0 && hashActions[0].needsCacheUpgrade) {
@@ -513,10 +511,47 @@ function getBestUpgrade(ns) {
     ? parseInt(nexusInfo.server.split('-').pop()) 
     : -1;
   const nexusTargetRam = getNexusTargetRam(ns);
-  
+
+  // BN9: prioritize nexus RAM upgrades until ready
+  if (isInBitNode(ns, 9) && nexusIndex >= 0 && !nexusInfo.ready) {
+    const stats = ns.hacknet.getNodeStats(nexusIndex);
+    const targetRam = getNexusTargetRam(ns);
+    if (stats.ram < targetRam) {
+      const ramUpgradeCost = ns.hacknet.getRamUpgradeCost(nexusIndex, 1);
+      if (ramUpgradeCost < Infinity) {
+        const normalBestUpgrade = getBestNonNexusUpgrade(ns, money, nexusIndex);
+        const priorityThreshold = normalBestUpgrade ? normalBestUpgrade.cost * 5 : Infinity;
+        const hashGain = stats.production * 0.035; // RAM upgrade = +3.5%
+
+        if (ramUpgradeCost <= money && ramUpgradeCost <= priorityThreshold) {
+          return {
+            nodeIndex: nexusIndex,
+            upgradeType: 'ram',
+            cost: ramUpgradeCost,
+            hashGain,
+            isNexusPriority: true,
+            roiDebug: { nexusPriority: true, targetRam, currentRam: stats.ram }
+          };
+        }
+
+        if (ramUpgradeCost > money) {
+          return {
+            nodeIndex: nexusIndex,
+            upgradeType: 'ram',
+            cost: ramUpgradeCost,
+            hashGain,
+            isAccumulating: true,
+            isNexusPriority: true,
+            roiDebug: { nexusPriority: true, targetRam, currentRam: stats.ram }
+          };
+        }
+      }
+    }
+  }
+
   let best = null;
   let bestRatio = 0;
-  
+
   // Track new server option separately - we'll compare after finding best affordable upgrade
   let newServerOption = null;
   let newServerRatio = 0;
@@ -868,9 +903,13 @@ async function handleBN9Nexus(ns) {
   if (!nexusDesignated) {
     const nexusIndex = findBestNexusCandidate(ns);
     if (nexusIndex >= 0) {
-      nexusDesignated = `hacknet-server-${nexusIndex}`;
-      setNexusHost(ns, nexusDesignated);
-      ns.print(`[HACKNET] Designated ${nexusDesignated} as nexus`);
+      const candidate = `hacknet-server-${nexusIndex}`;
+      if (tryDesignateNexus(ns, candidate, "hacknet-manager")) {
+        nexusDesignated = candidate;
+        ns.print(`[HACKNET] Designated ${nexusDesignated} as nexus`);
+      } else {
+        nexusDesignated = getNexusHost(ns);
+      }
     }
     return;
   }
@@ -913,6 +952,56 @@ async function handleBN9Nexus(ns) {
 }
 
 /**
+ * Get best upgrade (ROI) excluding the nexus server
+ * @param {NS} ns
+ * @param {number} money
+ * @param {number} nexusIndex
+ * @returns {{nodeIndex:number, upgradeType:string, cost:number, hashGain:number, ratio:number}|null}
+ */
+function getBestNonNexusUpgrade(ns, money, nexusIndex) {
+  const numNodes = ns.hacknet.numNodes();
+  let best = null;
+  let bestRatio = 0;
+
+  for (let i = 0; i < numNodes; i++) {
+    if (i === nexusIndex) continue;
+    const stats = ns.hacknet.getNodeStats(i);
+    const currentProduction = stats.production;
+
+    for (const type of ['level', 'ram', 'cores']) {
+      let cost, newProduction;
+      switch (type) {
+        case 'level':
+          cost = ns.hacknet.getLevelUpgradeCost(i, 1);
+          newProduction = currentProduction * (Math.max(1, stats.level) + 1) / Math.max(1, stats.level);
+          break;
+        case 'ram':
+          cost = ns.hacknet.getRamUpgradeCost(i, 1);
+          newProduction = currentProduction * 1.035;
+          break;
+        case 'cores':
+          cost = ns.hacknet.getCoreUpgradeCost(i, 1);
+          newProduction = currentProduction * (stats.cores + 6) / (stats.cores + 5);
+          break;
+        default:
+          continue;
+      }
+
+      if (cost === Infinity || cost > money) continue;
+      const hashGain = newProduction - currentProduction;
+      if (hashGain <= 0) continue;
+      const ratio = hashGain / cost;
+      if (ratio > bestRatio) {
+        bestRatio = ratio;
+        best = { nodeIndex: i, upgradeType: type, cost, hashGain, ratio };
+      }
+    }
+  }
+
+  return best;
+}
+
+/**
  * Print status
  * @param {NS} ns
  */
@@ -949,14 +1038,20 @@ function printStatus(ns) {
   // Show hash spending strategy
   if (isInBitNode(ns, 9)) {
     const studyMult = 1 + (studyingBoostsPurchased * CONFIG.STUDYING_BOOST_PER_USE);
-    const prioritizingStudy = totalProduction >= CONFIG.STUDYING_HASH_RATE_THRESHOLD && 
-                              studyMult < CONFIG.STUDYING_MAX_MULTIPLIER;
-    if (prioritizingStudy) {
+    const studyCapped = studyMult >= CONFIG.STUDYING_MAX_MULTIPLIER;
+    const hasEnoughProd = totalProduction >= CONFIG.STUDYING_HASH_RATE_THRESHOLD;
+    const incomeStarved = onlineIncome < hashMoneyRate * CONFIG.MONEY_SELL_THRESHOLD;
+
+    if (studyCapped && incomeStarved) {
+      ns.print("   → Selling hashes for money (studying capped, low income)");
+    } else if (!hasEnoughProd && incomeStarved) {
+      ns.print("   → Selling hashes for money (need upgrades first)");
+    } else if (hasEnoughProd && !studyCapped) {
       ns.print("   → Prioritizing study boosts (BN9)");
-    } else if (studyMult >= CONFIG.STUDYING_MAX_MULTIPLIER) {
-      ns.print("   → Study boost maxed, using other upgrades");
-    } else if (shouldSellHashesForMoney(ns)) {
-      ns.print("   → Selling hashes for money (low production)");
+    } else if (studyCapped) {
+      ns.print("   → Study boost maxed, using server boosts");
+    } else if (incomeStarved) {
+      ns.print("   → Selling hashes for money (income-starved)");
     }
   } else if (shouldSellHashesForMoney(ns)) {
     ns.print("   → Selling hashes for money (early game)");
@@ -1195,6 +1290,37 @@ export async function main(ns) {
   while (true) {
     // Handle BN9 nexus management
     await handleBN9Nexus(ns);
+
+    // In BN9, hacknet-manager is responsible for spawning orchestrator
+    if (isInBitNode(ns, 9)) {
+      const orchestratorScript = "orchestratorv2.js";
+      const alreadyRunning = ns.isRunning(orchestratorScript, "home") || 
+        (getNexusHost(ns) && ns.isRunning(orchestratorScript, getNexusHost(ns)));
+      
+      if (!alreadyRunning) {
+        // Try nexus first if ready
+        if (nexusScriptsLaunched) {
+          const nexusInfo = getNexusInfo(ns);
+          if (nexusInfo.ready && nexusInfo.server) {
+            copyScriptsToNexus(ns, nexusInfo.server);
+            const pid = ns.exec(orchestratorScript, nexusInfo.server, 1);
+            if (pid > 0) {
+              ns.print(`[BN9] Spawned orchestrator on ${nexusInfo.server} (PID: ${pid})`);
+            }
+          }
+        } else {
+          // Fallback: try home while nexus is being upgraded
+          const homeRam = ns.getServerMaxRam("home") - ns.getServerUsedRam("home");
+          const orchestratorRam = ns.getScriptRam(orchestratorScript);
+          if (homeRam >= orchestratorRam) {
+            const pid = ns.exec(orchestratorScript, "home", 1);
+            if (pid > 0) {
+              ns.print(`[BN9] Spawned orchestrator on home (PID: ${pid}) - nexus not ready yet`);
+            }
+          }
+        }
+      }
+    }
     
     // Spend hashes (multiple times if near capacity)
     let hashesSpent = 0;

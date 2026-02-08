@@ -13,6 +13,7 @@ const KEY_AUGS = [
   "Cranial Signal Processors - Gen I", "Cranial Signal Processors - Gen II", //Cybersec
   "Embedded Netburner Module", "Cranial Signal Processors - Gen III", "CRTX42-AA Gene Modification", //Nitesec
   "The Black Hand", //Black hand
+  "Hacknet Node Core Direct-Neural Interface", //covers all netburners exclusives, highest cost netburners aug. netburners now useful because of hacknet servers.
   "Social Negotiation Assistant (S.N.A)", //Tian Di Hua ex - faction rep gain! only 6.5k
   "SmartSonar Implant", //Slum snakes ex
   "PCMatrix", //Aevum ex
@@ -44,6 +45,13 @@ const KEY_AUGS = [
   "The Red Pill" //obviously!!!
 ];
 
+// Augs that only benefit the player - sleeves can't use these
+// Sleeves should NOT grind for these if the player already has them
+const PLAYER_ONLY_AUGS = [
+  "The Red Pill",  // Destroys BitNode - sleeves can't use
+  "Hacknet Node Core Direct-Neural Interface", //ignore if player has it, sleeves can't use hacknet improvements
+];
+
 // Company -> Faction mapping
 const COMPANY_FACTION_MAP = {
   "ECorp": "ECorp",
@@ -66,28 +74,27 @@ const FACTION_COMPANY_MAP = Object.fromEntries(
 // Company priority order for initial unlocking
 // Rationale:
 // 1. ECorp - PC Direct-Neural Interface prereq, Graphene Bionic Spine/Legs (+60% combat, +150% agi)
-// 2. OmniTek - Also has PC Direct-Neural prereq, OmniTek InfoLoad (+25% hacking)
-// 3. Fulcrum - PC Direct-Neural NeuroNet Injector (+100% company rep) - needs prereq first!
-// 4. Bachman - SmartJaw (+25% faction & company rep, +50% charisma)
-// 5. MegaCorp - CordiARC Fusion Reactor (+35% combat stats & XP), also has Graphene Legs
-// 6. NWO - Xanipher (+20% all skills)
-// 7. Clarke - nextSENS Gene Modification (+20% all skills)
-// 8. KuaiGong - Photosynthetic Cells (+40% combat stats)
-// 9. Blade Industries - Neotra (+55% STR/DEX)
-// 10. Four Sigma - Enhanced Social Interaction Implant (+60% charisma) - lower priority
-//
+// 2. Bachman - SmartJaw (+25% faction & company rep, +50% charisma)
+// 3. MegaCorp - CordiARC Fusion Reactor (+35% combat stats & XP), also has Graphene Legs
+// 4. NWO - Xanipher (+20% all skills)
+// 5. Clarke - nextSENS Gene Modification (+20% all skills)
+// 6. KuaiGong - Photosynthetic Cells (+40% combat stats)
+// 7. Blade Industries - Neotra (+55% STR/DEX)
+// 8. OmniTek - OmniTek InfoLoad (+25% hacking)
+// 9. Four Sigma - Enhanced Social Interaction Implant (+60% charisma) - lower priority
+// 10. Fulcrum - PC Direct-Neural NeuroNet Injector (+100% company rep) - last priority, player is grafting it instead
 // TODO: Build analysis script to optimize this order based on current aug ownership
 const COMPANY_PRIORITY_ORDER = [
   "ECorp",
-  "OmniTek Incorporated",
-  "Fulcrum Technologies",
   "Bachman & Associates",
   "MegaCorp",
   "NWO",
   "Clarke Incorporated",
   "KuaiGong International",
   "Blade Industries",
+  "OmniTek Incorporated",
   "Four Sigma",
+  "Fulcrum Technologies",
 ];
 
 // All megacorp companies that unlock factions (in priority order)
@@ -108,6 +115,11 @@ export const REP_FOR_DONATION_FAVOR = 460000;    // Rep needed to reach 150 favo
 // If an aug requires more than this, we cap grinding at REP_FOR_DONATION_FAVOR
 // and plan to buy the rest with donations next run
 export const HIGH_REP_AUG_THRESHOLD = 1000000;   // 1M rep
+
+// Envelope threshold for company prioritization
+// If two companies' timeUnits are within this ratio, use priority order instead
+// E.g., 1.05 = companies within 5% of each other use priority order
+const COMPANY_PRIORITY_ENVELOPE = 1.05;
 
 // Company threshold status enum
 export const CompanyThresholdStatus = Object.freeze({
@@ -445,6 +457,56 @@ function calculateTimeUnits(currentRep, targetRep, favor) {
 }
 
 /**
+ * Get the player's faction rep multiplier
+ * @param {NS} ns
+ * @returns {number}
+ */
+function getPlayerFactionRepMult(ns) {
+  const player = ns.getPlayer();
+  return player.mults?.faction_rep || 1;
+}
+
+/**
+ * Get the player's company rep multiplier
+ * @param {NS} ns
+ * @returns {number}
+ */
+function getPlayerCompanyRepMult(ns) {
+  const player = ns.getPlayer();
+  return player.mults?.company_rep || 1;
+}
+
+/**
+ * Get sleeve rep multipliers
+ * @param {NS} ns
+ * @param {number} sleeveNum
+ * @returns {{faction: number, company: number}}
+ */
+function getSleeveRepMults(ns, sleeveNum = 0) {
+  const sleeve = ns.sleeve.getSleeve(sleeveNum);
+  return {
+    faction: sleeve.mults?.faction_rep || 1,
+    company: sleeve.mults?.company_rep || 1,
+  };
+}
+
+/**
+ * Calculate time units with favor + rep multipliers
+ * @param {number} currentRep
+ * @param {number} targetRep
+ * @param {number} favor
+ * @param {number} repMultiplier
+ * @returns {number}
+ */
+function calculateTimeUnitsWithMult(currentRep, targetRep, favor, repMultiplier = 1) {
+  if (currentRep >= targetRep) return 0;
+  const remainingRep = targetRep - currentRep;
+  const favorMultiplier = 1 + favor / 100;
+  const effectiveMultiplier = favorMultiplier * repMultiplier;
+  return remainingRep / effectiveMultiplier;
+}
+
+/**
  * Calculate weighted average for a work type given stats
  * @param {Object} stats - {hacking, strength, defense, dexterity, agility, charisma}
  * @param {Object} weights - Weight multipliers for each stat
@@ -535,17 +597,35 @@ function getBestCompanyPosition(ns, stats, companyName) {
  * @returns {Object[]} Array of up to 8 job objects, sorted by priority
  */
 export function getPriorityJobs(ns, stats, forSleeves = false, excludedJobs = new Set(), config = {}) {
-  const { deprioritizeDonatable = DEPRIORITIZE_DONATABLE_FACTIONS } = config;
+  const { deprioritizeDonatable = DEPRIORITIZE_DONATABLE_FACTIONS, sleeveNum = 0 } = config;
   
   const jobs = [];
+
+  let factionRepMult;
+  let companyRepMult;
+  if (forSleeves) {
+    const sleeveMults = getSleeveRepMults(ns, sleeveNum);
+    factionRepMult = sleeveMults.faction;
+    companyRepMult = sleeveMults.company;
+  } else {
+    factionRepMult = getPlayerFactionRepMult(ns);
+    companyRepMult = getPlayerCompanyRepMult(ns);
+  }
   
-  // Get owned augs
+  // Get owned augs - for sleeves, check what the SLEEVE has
   let ownedAugs;
   if (forSleeves) {
-    ownedAugs = ns.sleeve.getSleeveAugmentations(0);
+    ownedAugs = ns.sleeve.getSleeveAugmentations(sleeveNum);
   } else {
     ownedAugs = ns.singularity.getOwnedAugmentations(true);
   }
+  
+  // For sleeves: get player's augs to filter out player-only augs the player already has
+  // Sleeves shouldn't grind for augs they can't use if player already got them
+  const playerOwnedAugs = forSleeves ? ns.singularity.getOwnedAugmentations(true) : ownedAugs;
+  const skipAugsForSleeves = forSleeves 
+    ? new Set(PLAYER_ONLY_AUGS.filter(aug => playerOwnedAugs.includes(aug)))
+    : new Set();
   
   // Get all factions we've joined
   const allFactions = Object.values(ns.enums.FactionName);
@@ -589,8 +669,9 @@ export function getPriorityJobs(ns, stats, forSleeves = false, excludedJobs = ne
     
     // ONLY consider key augs - skip factions that don't have any key augs we need
     // Also skip augs that are already unlocked at another faction (for player only)
+    // For sleeves: also skip player-only augs that the player already has
     const keyAugsFromFaction = purchasableAugs.filter(aug => 
-      KEY_AUGS.includes(aug) && !alreadyUnlockedAugs.has(aug)
+      KEY_AUGS.includes(aug) && !alreadyUnlockedAugs.has(aug) && !skipAugsForSleeves.has(aug)
     );
     
     if (keyAugsFromFaction.length === 0) {
@@ -637,7 +718,7 @@ export function getPriorityJobs(ns, stats, forSleeves = false, excludedJobs = ne
     // (money script will handle donations)
     const canDonate = factionFavor >= FAVOR_DONATION_THRESHOLD;
     
-    let timeUnits = calculateTimeUnits(factionRep, effectiveTarget, factionFavor);
+    let timeUnits = calculateTimeUnitsWithMult(factionRep, effectiveTarget, factionFavor, factionRepMult);
     
     // Priority modifier for certain "gating" augs that accelerate future progress
     // PC Direct family gives company rep bonuses, so we want them BEFORE company grinding
@@ -672,6 +753,7 @@ export function getPriorityJobs(ns, stats, forSleeves = false, excludedJobs = ne
       isDaedalusRedPill: isDaedalusRedPill,
       cappedForDonation: cappedForDonation,
       canDonate: canDonate,
+      repMultiplier: factionRepMult,
     });
   }
   
@@ -725,7 +807,7 @@ export function getPriorityJobs(ns, stats, forSleeves = false, excludedJobs = ne
     // Skip if we've already reached the target
     if (companyRep >= targetRep) continue;
     
-    const timeUnits = calculateTimeUnits(companyRep, targetRep, companyFavor);
+    const timeUnits = calculateTimeUnitsWithMult(companyRep, targetRep, companyFavor, companyRepMult);
     const activity = getBestCompanyPosition(ns, stats, company);
     
     jobs.push({
@@ -740,6 +822,8 @@ export function getPriorityJobs(ns, stats, forSleeves = false, excludedJobs = ne
       goalDescription: goalDescription,
       associatedFaction: associatedFaction,
       isDaedalusRedPill: false,
+      repMultiplier: companyRepMult,
+      priorityIndex: COMPANY_PRIORITY_ORDER.indexOf(company),  // For envelope tie-breaking
     });
   }
   
@@ -747,6 +831,10 @@ export function getPriorityJobs(ns, stats, forSleeves = false, excludedJobs = ne
   // Lower time units = higher priority (closer to goal)
   // If deprioritizeDonatable is true, factions with favor ≥150 are pushed to end
   // (including Daedalus - buying 2.5M rep is faster than grinding)
+  // 
+  // ENVELOPE HEURISTIC: For company jobs targeting unlock_faction (400k),
+  // if two companies are within COMPANY_PRIORITY_ENVELOPE of each other,
+  // use priority order instead of small favor differences.
   
   jobs.sort((a, b) => {
     // If deprioritizing donatable factions, handle that first
@@ -766,6 +854,21 @@ export function getPriorityJobs(ns, stats, forSleeves = false, excludedJobs = ne
     // Silhouette grind is always lowest priority (only when nothing else to do)
     if (a.isSilhouetteGrind && !b.isSilhouetteGrind) return 1;
     if (b.isSilhouetteGrind && !a.isSilhouetteGrind) return -1;
+    
+    // Envelope heuristic for company jobs going for 400k (unlock_faction)
+    // If both are company jobs with similar timeUnits, use priority order
+    const bothCompaniesFor400k = a.type === "company" && b.type === "company" &&
+      a.goalDescription === "unlock_faction" && b.goalDescription === "unlock_faction";
+    
+    if (bothCompaniesFor400k && a.priorityIndex >= 0 && b.priorityIndex >= 0) {
+      const minTime = Math.min(a.timeUnits, b.timeUnits);
+      const maxTime = Math.max(a.timeUnits, b.timeUnits);
+      
+      // If within envelope (e.g., within 5%), use priority order
+      if (maxTime <= minTime * COMPANY_PRIORITY_ENVELOPE) {
+        return a.priorityIndex - b.priorityIndex;
+      }
+    }
     
     // Otherwise sort by time units (lower = higher priority)
     return a.timeUnits - b.timeUnits;
@@ -852,7 +955,10 @@ export async function main(ns) {
     ns.print(`#${i + 1}: [${job.type.toUpperCase()}] ${job.name}`);
     ns.print(`    Activity: ${job.activity}`);
     ns.print(`    Rep: ${repProgress} (favor: ${job.favor.toFixed(1)})`);
-    ns.print(`    Time Units: ${timeStr}`);
+    const multiplierNote = job.repMultiplier && job.repMultiplier !== 1
+      ? ` (mult: ${job.repMultiplier.toFixed(2)}x)`
+      : "";
+    ns.print(`    Time Units: ${timeStr}${multiplierNote}`);
     
     if (job.type === "faction") {
       ns.print(`    Target Aug: ${job.targetAug}`);

@@ -27,22 +27,34 @@ const NEXUS_DESIGNATION_FILE = '/data/nexus-designation.json';
 const NEXUS_TARGET_RAM_BASE = 512; // GB - base target before SF4 multipliers
 
 /**
+ * Execute a script as a singleton - checks both target server AND common locations
+ * (home, nexus) to prevent duplication across server migrations.
  * @param {NS} ns
  * @param {string} script
  * @param {string} targetServer
- * @param {boolean} withRestart
- * @returns {number}
+ * @param {boolean} withRestart - If true, kills existing instance on targetServer before starting
+ * @returns {number} PID if started, 0 if already running somewhere
  */
 export function execSingleton(ns, script, targetServer, withRestart) {
+  // Check if running on target
+  const runningOnTarget = ns.isRunning(script, targetServer);
+  
+  // Check common singleton locations to prevent cross-server duplication
+  const runningOnHome = targetServer !== "home" && ns.isRunning(script, "home");
+  const nexus = getNexusHost(ns);
+  const runningOnNexus = nexus && targetServer !== nexus && ns.isRunning(script, nexus);
+  
   if (withRestart) {
+    // Only kill on target server, not other locations
     ns.kill(script, targetServer);
     return ns.exec(script, targetServer);
   } else {
-    if (!ns.isRunning(script, targetServer)) {
-      return ns.exec(script, targetServer);
+    // Don't start if running ANYWHERE
+    if (runningOnTarget || runningOnHome || runningOnNexus) {
+      return 0;
     }
+    return ns.exec(script, targetServer);
   }
-  return 0;
 }
 
 /**
@@ -189,41 +201,39 @@ function writeNexusDesignation(ns, server) {
 
 /**
  * Find the best hacknet server to use as nexus in BN9
- * Criteria: Largest RAM with smallest level/cores (least "upgraded" for hash production)
+ * Strategy: prefer hacknet-server-1 to avoid wasting heavily-upgraded server-0
  * @param {NS} ns
  * @returns {string|null}
  */
 function findBestHacknetNexus(ns) {
   if (!hasHacknetServers(ns)) return null;
-  
   const numNodes = ns.hacknet.numNodes();
   if (numNodes === 0) return null;
-  
+
+  // Need at least two nodes so server-0 can focus on hash production
+  if (numNodes < 2) {
+    return null;
+  }
+
+  const preferred = "hacknet-server-1";
+  if (ns.serverExists(preferred)) {
+    return preferred;
+  }
+
+  // Fallback: pick the lowest production server (skipping server-0 when possible)
   let bestServer = null;
-  let bestScore = -Infinity;
-  
+  let lowestProduction = Infinity;
+
   for (let i = 0; i < numNodes; i++) {
+    if (i === 0 && numNodes > 1) continue;
     const hostname = `hacknet-server-${i}`;
     const stats = ns.hacknet.getNodeStats(i);
-    
-    // We want: high RAM, low level, low cores
-    // Score = RAM / (level * cores) - higher is better for nexus role
-    // More RAM = more scripts we can run
-    // Lower level/cores = less valuable for hash production
-    const ram = stats.ram;
-    const productionValue = stats.level * stats.cores;
-    
-    // Only consider servers with enough RAM for nexus role
-    if (ram < 64) continue; // Minimum useful RAM
-    
-    const score = ram / Math.max(1, productionValue);
-    
-    if (score > bestScore) {
-      bestScore = score;
+    if (stats.production < lowestProduction) {
+      lowestProduction = stats.production;
       bestServer = hostname;
     }
   }
-  
+
   return bestServer;
 }
 
@@ -261,16 +271,15 @@ function findPurchasedNexus(ns, minRam = 0) {
 export function getNexusHost(ns, minRam = 0) {
   // First check file-based designation (single source of truth)
   const fileDesignation = readNexusDesignation(ns);
-  if (fileDesignation.server) {
+  if (fileDesignation.server && ns.serverExists(fileDesignation.server)) {
     const ram = ns.getServerMaxRam(fileDesignation.server);
     if (ram >= minRam) {
-      // Update in-memory cache
       designatedNexus = fileDesignation.server;
       nexusDesignatedAt = fileDesignation.designatedAt;
       return designatedNexus;
     }
   }
-  
+
   // Return cached nexus if still valid (fallback)
   if (designatedNexus && ns.serverExists(designatedNexus)) {
     const ram = ns.getServerMaxRam(designatedNexus);
@@ -278,9 +287,23 @@ export function getNexusHost(ns, minRam = 0) {
       return designatedNexus;
     }
   }
-  
-  // In BN9 or with SF9, check hacknet servers first
-  if (hasHacknetServers(ns) && !canPurchaseServers(ns)) {
+
+  // PRIORITY: Purchased server named "nexus" (if purchasable)
+  if (canPurchaseServers(ns)) {
+    const purchasedNexus = findPurchasedNexus(ns, minRam);
+    if (purchasedNexus) {
+      designatedNexus = purchasedNexus;
+      nexusDesignatedAt = Date.now();
+      writeNexusDesignation(ns, designatedNexus);
+      return designatedNexus;
+    }
+
+    // Let server-manager create one instead of falling back to hacknet
+    return null;
+  }
+
+  // BN9 fallback: only use hacknet nexus when regular servers aren't possible
+  if (hasHacknetServers(ns)) {
     const hacknetNexus = findBestHacknetNexus(ns);
     if (hacknetNexus) {
       const ram = ns.getServerMaxRam(hacknetNexus);
@@ -292,16 +315,7 @@ export function getNexusHost(ns, minRam = 0) {
       }
     }
   }
-  
-  // Check purchased servers
-  const purchasedNexus = findPurchasedNexus(ns, minRam);
-  if (purchasedNexus) {
-    designatedNexus = purchasedNexus;
-    nexusDesignatedAt = Date.now();
-    writeNexusDesignation(ns, designatedNexus);
-    return designatedNexus;
-  }
-  
+
   return null;
 }
 
@@ -319,6 +333,28 @@ export function setNexusHost(ns, server) {
   nexusDesignatedAt = Date.now();
   writeNexusDesignation(ns, server);
   return true;
+}
+
+/**
+ * Designate a nexus server with conflict detection
+ * @param {NS} ns
+ * @param {string} server
+ * @param {string} caller
+ * @returns {boolean}
+ */
+export function tryDesignateNexus(ns, server, caller = "unknown") {
+  const existing = readNexusDesignation(ns);
+
+  if (existing.server && existing.server !== server && ns.serverExists(existing.server)) {
+    ns.print(`[SERVER-UTILS] Nexus already designated to ${existing.server}, rejecting ${server} from ${caller}`);
+    return false;
+  }
+
+  const success = setNexusHost(ns, server);
+  if (success) {
+    ns.print(`[SERVER-UTILS] ${caller} designated ${server} as nexus`);
+  }
+  return success;
 }
 
 /**

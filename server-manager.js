@@ -171,17 +171,68 @@ function areAllServersMaxed(ns) {
 }
 
 function ensureHackingOrchestrator(ns) {
-  // Try to spawn singleton on home
+  const nexusInfo = getNexusInfo(ns);
+  const isBN9 = isHacknetBitNode(ns);
+
+  if (ns.isRunning(CONFIG.HACKING_ORCHESTRATOR_SCRIPT, "home")) {
+    return true;
+  }
+
+  if (nexusInfo.server && ns.isRunning(CONFIG.HACKING_ORCHESTRATOR_SCRIPT, nexusInfo.server)) {
+    return true;
+  }
+
+  if (isBN9) {
+    if (nexusInfo.ready && nexusInfo.server) {
+      copyScriptsToNexus(ns, nexusInfo.server);
+      const pid = ns.exec(CONFIG.HACKING_ORCHESTRATOR_SCRIPT, nexusInfo.server, 1);
+      if (pid > 0) {
+        ns.print(`[ORCHESTRATOR] Spawned on ${nexusInfo.server} (BN9 mode), pid:[${pid}]`);
+        return true;
+      }
+    }
+    ns.print(`[ORCHESTRATOR] Waiting for nexus to be ready (BN9 mode)`);
+    return false;
+  }
+
   if (ns.fileExists(CONFIG.HACKING_ORCHESTRATOR_SCRIPT, "home")) {
     const pid = execSingleton(ns, CONFIG.HACKING_ORCHESTRATOR_SCRIPT, "home", false);
     if (pid > 0) {
-      ns.tprint(`[ORCHESTRATOR] Spawned hacking orchestrator on home, pid:[${pid}] `);
+      ns.print(`[ORCHESTRATOR] Spawned on home, pid:[${pid}]`);
       return true;
-    } else {
-      ns.tprint(`[ORCHESTRATOR] Failed to spawn! Probably insufficient RAM`);
+    }
+    ns.print(`[ORCHESTRATOR] Failed to spawn on home - insufficient RAM`);
+  }
+
+  return false;
+}
+
+function isHacknetManagerRunningAnywhere(ns) {
+  if (ns.isRunning(CONFIG.HACKNET_MANAGER_SCRIPT, "home")) {
+    return "home";
+  }
+
+  for (const server of ns.getPurchasedServers()) {
+    if (ns.isRunning(CONFIG.HACKNET_MANAGER_SCRIPT, server)) {
+      return server;
     }
   }
-  return false;
+
+  if (hasHacknetServers(ns)) {
+    try {
+      const nodes = ns.hacknet.numNodes();
+      for (let i = 0; i < nodes; i++) {
+        const hostname = `hacknet-server-${i}`;
+        if (ns.serverExists(hostname) && ns.isRunning(CONFIG.HACKNET_MANAGER_SCRIPT, hostname)) {
+          return hostname;
+        }
+      }
+    } catch {
+      // hacknet API not available
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -191,52 +242,44 @@ function ensureHackingOrchestrator(ns) {
  */
 function ensureHacknetManager(ns) {
   if (hacknetManagerSpawned) {
-    ns.tprint(`[MANAGER] ${CONFIG.HACKNET_MANAGER_SCRIPT} already tagged running in var`);
     return true;
   }
 
-  // Check if already running on home
-  if (ns.isRunning(CONFIG.HACKNET_MANAGER_SCRIPT, "home")) {
+  const existingHost = isHacknetManagerRunningAnywhere(ns);
+  if (existingHost) {
     hacknetManagerSpawned = true;
-    ns.tprint(`[MANAGER] ${CONFIG.HACKNET_MANAGER_SCRIPT} already running on home`);
+    ns.print(`[MANAGER] hacknet-manager already running on ${existingHost}`);
     return true;
   }
-  
-  // Check if running on nexus
+
+  const nexusInfo = getNexusInfo(ns);
   const nexus = getNexusHost(ns, 64);
-  if (nexus && ns.isRunning(CONFIG.HACKNET_MANAGER_SCRIPT, nexus)) {
-    hacknetManagerSpawned = true;
-    ns.tprint(`[MANAGER] ${CONFIG.HACKNET_MANAGER_SCRIPT} already running on nexus`);
-    return true;
+  const homeRamFree = ns.getServerMaxRam("home") - ns.getServerUsedRam("home");
+  const hacknetRamCost = ns.getScriptRam(CONFIG.HACKNET_MANAGER_SCRIPT);
+
+  if (nexusInfo.ready && nexus) {
+    const nexusRamFree = ns.getServerMaxRam(nexus) - ns.getServerUsedRam(nexus);
+    if (nexusRamFree >= hacknetRamCost && ns.fileExists(CONFIG.HACKNET_MANAGER_SCRIPT, nexus)) {
+      const pid = ns.exec(CONFIG.HACKNET_MANAGER_SCRIPT, nexus, 1);
+      if (pid > 0) {
+        ns.print(`[MANAGER] Spawned hacknet-manager on ${nexus} (PID: ${pid})`);
+        hacknetManagerSpawned = true;
+        return true;
+      }
+    }
   }
-  
-  // Try to spawn on home first (where the script files are)
-  if (ns.fileExists(CONFIG.HACKNET_MANAGER_SCRIPT, "home")) {
+
+  if (homeRamFree >= hacknetRamCost && ns.fileExists(CONFIG.HACKNET_MANAGER_SCRIPT, "home")) {
     const pid = ns.exec(CONFIG.HACKNET_MANAGER_SCRIPT, "home", 1);
     if (pid > 0) {
-      ns.tprint(`[MANAGER] Spawned hacknet-manager.js on home (PID: ${pid})`);
+      ns.print(`[MANAGER] Spawned hacknet-manager on home (PID: ${pid})`);
       hacknetManagerSpawned = true;
       return true;
-    } else {
-      ns.tprint(`[MANAGER] Failed to spawn hacknet-manager.js on home. Likely insufficient RAM`);
-      return false;
     }
   }
-  
-  // Fallback: try nexus if home didn't work and nexus has the script
-  if (nexus && ns.fileExists(CONFIG.HACKNET_MANAGER_SCRIPT, nexus)) {
-    const pid = ns.exec(CONFIG.HACKNET_MANAGER_SCRIPT, nexus, 1);
-    if (pid > 0) {
-      ns.tprint(`[MANAGER] Spawned hacknet-manager.js on ${nexus} (PID: ${pid})`);
-      hacknetManagerSpawned = true;
-      return true;
-    } else {
-      ns.tprint(`[MANAGER] Failed to spawn hacknet-manager.js on ${nexus}. Likely insufficient RAM`);
-      return false;
-    }
-  }
-  
-  ns.tprint(`[MANAGER] ${CONFIG.HACKNET_MANAGER_SCRIPT} not found on home`);
+
+  ns.print(`[MANAGER] Cannot spawn hacknet-manager yet - insufficient RAM`);
+  ns.print(`  Home free: ${ns.formatRam(homeRamFree)}, Nexus ready: ${nexusInfo.ready}, Need: ${ns.formatRam(hacknetRamCost)}`);
   return false;
 }
 
@@ -294,6 +337,21 @@ function printStatus(ns) {
     const hacknetStatus = hacknetManagerSpawned ? "✅ Running" : "⏳ Pending";
     ns.print(`🔗 Hacknet Manager: ${hacknetStatus}`);
   }
+  ns.print("");
+
+  // RAM analysis
+  ns.print("─── RAM STATUS ───");
+  const homeRamTotal = ns.getServerMaxRam("home");
+  const homeRamUsed = ns.getServerUsedRam("home");
+  const homeRamFree = homeRamTotal - homeRamUsed;
+  const orchestratorRam = ns.getScriptRam(CONFIG.HACKING_ORCHESTRATOR_SCRIPT);
+  const hacknetRam = ns.getScriptRam(CONFIG.HACKNET_MANAGER_SCRIPT);
+  const serverMgrRam = ns.getScriptRam("server-manager.js");
+  ns.print(`  Home: ${ns.formatRam(homeRamUsed)}/${ns.formatRam(homeRamTotal)} (${ns.formatRam(homeRamFree)} free)`);
+  ns.print(`  Scripts: orch=${ns.formatRam(orchestratorRam)}, hacknet=${ns.formatRam(hacknetRam)}, srvmgr=${ns.formatRam(serverMgrRam)}`);
+  const canFitOrchestrator = homeRamFree >= orchestratorRam;
+  const canFitHacknet = homeRamFree >= hacknetRam;
+  ns.print(`  Can fit: orchestrator=${canFitOrchestrator ? '✅' : '❌'}, hacknet=${canFitHacknet ? '✅' : '❌'}`);
   ns.print("");
   
   // Server RAM tiers
@@ -423,6 +481,10 @@ export async function main(ns) {
   while (true) {
     const servers = ns.getPurchasedServers();
     const nexusInfo = getNexusInfo(ns);
+
+    if (canPurchaseHacknets(ns) && !hacknetManagerSpawned) {
+      ensureHacknetManager(ns);
+    }
     
     // Check if nexus just became ready
     if (nexusInfo.ready && !nexusScriptsLaunched) {
